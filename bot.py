@@ -6,6 +6,8 @@ Setup is in README.md. Quick reference:
     python bot.py --plan                  # preview when texts will go out (sends nothing)
     python bot.py --now "good morning"    # send one text from that slot right now
     python bot.py --now "good morning" --to me   # same, but to your Saved Messages
+
+With [ai] turned on in config.toml, Claude writes each text (see ai.py).
 """
 
 import argparse
@@ -43,6 +45,14 @@ class Slot:
 
 
 @dataclass
+class AIConfig:
+    model: str
+    api_key: str | None
+    about_us: str
+    read_recent_chat: bool
+
+
+@dataclass
 class Config:
     api_id: int | str | None
     api_hash: str | None
@@ -52,6 +62,7 @@ class Config:
     skip_if_texted_within: timedelta | None
     session_path: Path
     state_path: Path
+    ai: AIConfig | None = None
 
     def slot(self, name: str) -> Slot:
         for slot in self.slots:
@@ -109,6 +120,16 @@ def load_config(path: Path) -> Config:
     if not slots:
         raise ConfigError("Add at least one [[schedule]] section.")
 
+    ai = None
+    ai_raw = raw.get("ai", {})
+    if ai_raw.get("enabled", False):
+        ai = AIConfig(
+            model=str(ai_raw.get("model") or "claude-opus-5-5"),
+            api_key=ai_raw.get("api_key") or None,
+            about_us=str(ai_raw.get("about_us", "")).strip(),
+            read_recent_chat=bool(ai_raw.get("read_recent_chat", True)),
+        )
+
     skip_minutes = float(raw.get("skip_if_i_texted_within_minutes", 0))
     return Config(
         api_id=raw.get("api_id"),
@@ -119,6 +140,7 @@ def load_config(path: Path) -> Config:
         skip_if_texted_within=timedelta(minutes=skip_minutes) if skip_minutes > 0 else None,
         session_path=path.parent / "telebot",
         state_path=path.parent / "state.json",
+        ai=ai,
     )
 
 
@@ -191,7 +213,7 @@ async def sleep_until(when: datetime):
         await asyncio.sleep(min(remaining, 60))
 
 
-async def connect(cfg: Config, recipient: str):
+async def connect(cfg: Config):
     try:
         from telethon import TelegramClient
     except ImportError:
@@ -202,15 +224,79 @@ async def connect(cfg: Config, recipient: str):
 
     client = TelegramClient(str(cfg.session_path), int(cfg.api_id), str(cfg.api_hash))
     await client.start()  # asks for your phone number and login code the first time
+    return client
+
+
+async def find(client, who: str):
     try:
-        entity = await client.get_entity(recipient)
+        return await client.get_entity(who)
     except ValueError:
-        await client.disconnect()
         raise ConfigError(
-            f"Couldn't find {recipient!r} on Telegram. Use her @username, "
+            f"Couldn't find {who!r} on Telegram. Use her @username, "
             "or a phone number that's saved in your contacts."
         ) from None
-    return client, entity
+
+
+async def resolve(client, cfg: Config, recipient: str, writer):
+    """Who the texts go to, and her chat (for the AI to read). They differ only for test runs with --to."""
+    to = await find(client, recipient)
+    if recipient == cfg.recipient:
+        return to, to
+    reads_chat = writer is not None and cfg.ai.read_recent_chat
+    return to, (await find(client, cfg.recipient) if reads_chat else None)
+
+
+def make_writer(cfg: Config):
+    """The AI that writes the texts, or None if [ai] is turned off."""
+    if cfg.ai is None:
+        return None
+    try:
+        from ai import Writer
+    except ImportError:
+        raise ConfigError("AI is on but its packages aren't installed. Run: pip install -r requirements.txt") from None
+    writer = Writer(cfg.ai.model, cfg.ai.api_key, cfg.ai.about_us)
+    if not writer.has_credentials():
+        raise ConfigError(
+            "AI is on but there's no Anthropic API key. Set the ANTHROPIC_API_KEY environment "
+            "variable, or api_key under [ai] in config.toml (or set enabled = false)."
+        )
+    if "___" in cfg.ai.about_us:
+        log.warning("Tip: fill in about_us under [ai] in config.toml so the texts sound like you two")
+    return writer
+
+
+def _describe(message) -> str:
+    for attr, label in (("sticker", "sticker"), ("gif", "GIF"), ("photo", "photo"),
+                        ("voice", "voice message"), ("video", "video")):
+        if getattr(message, attr, None):
+            return f"[{label}]"
+    return "[non-text message]"
+
+
+async def recent_chat(client, her, tz: ZoneInfo) -> list[tuple[datetime, str, str]]:
+    """The last few days of your chat with her, oldest first."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=3)
+    chat = []
+    async for message in client.iter_messages(her, limit=40):
+        if message.date < cutoff:
+            break
+        text = getattr(message, "message", None) or _describe(message)
+        chat.append((message.date.astimezone(tz), "me" if message.out else "her", text))
+    return chat[::-1]
+
+
+async def compose(cfg: Config, writer, client, her, slot: Slot, state: State) -> str | None:
+    """The text to send for this slot, or None if the AI thinks now's a bad time."""
+    recent = state.recent(slot.name)
+    if writer is not None:
+        chat = await recent_chat(client, her, cfg.tz) if cfg.ai.read_recent_chat else None
+        draft = await writer.write(slot.name, slot.messages, datetime.now(cfg.tz), chat, recent)
+        if draft is not None:
+            if not draft.send:
+                log.info('Not sending "%s": %s', slot.name, draft.skip_reason)
+                return None
+            return draft.message
+    return pick_message(slot, recent)
 
 
 async def texted_recently(client, entity, within: timedelta | None) -> bool:
@@ -240,23 +326,27 @@ async def send(client, entity, text: str):
             await asyncio.sleep(30)
 
 
-async def run_forever(cfg: Config, state: State, recipient: str, skip_within: timedelta | None):
-    client, entity = await connect(cfg, recipient)
-    log.info("Logged in. Texting %s on schedule (Ctrl+C to stop).", recipient)
-    # Start from yesterday in case a window that runs past midnight is still open.
-    day = datetime.now(cfg.tz).date() - timedelta(days=1)
+async def run_forever(cfg: Config, state: State, writer, recipient: str, skip_within: timedelta | None):
+    client = await connect(cfg)
     try:
+        to, her = await resolve(client, cfg, recipient, writer)
+        log.info("Logged in. Texting %s on schedule%s (Ctrl+C to stop).", recipient, ", AI on" if writer else "")
+        # Start from yesterday in case a window that runs past midnight is still open.
+        day = datetime.now(cfg.tz).date() - timedelta(days=1)
         while True:
             for when, slot in plan_day(day, cfg.slots, cfg.tz, datetime.now(cfg.tz), state):
                 log.info('Next up: "%s" at %s', slot.name, when.strftime("%a %H:%M"))
                 await sleep_until(when)
-                if await texted_recently(client, entity, skip_within):
-                    log.info('Skipping "%s": you already texted her recently', slot.name)
-                    state.record(slot.name, day)
-                    continue
-                text = pick_message(slot, state.recent(slot.name))
                 try:
-                    await send(client, entity, text)
+                    if await texted_recently(client, to, skip_within):
+                        log.info('Skipping "%s": you already texted her recently', slot.name)
+                        state.record(slot.name, day)
+                        continue
+                    text = await compose(cfg, writer, client, her, slot, state)
+                    if text is None:
+                        state.record(slot.name, day)
+                        continue
+                    await send(client, to, text)
                 except Exception:
                     log.exception('Failed to send "%s"', slot.name)
                     continue
@@ -268,11 +358,14 @@ async def run_forever(cfg: Config, state: State, recipient: str, skip_within: ti
         await client.disconnect()
 
 
-async def send_now(cfg: Config, state: State, recipient: str, slot: Slot):
-    client, entity = await connect(cfg, recipient)
+async def send_now(cfg: Config, state: State, writer, recipient: str, slot: Slot):
+    client = await connect(cfg)
     try:
-        text = pick_message(slot, state.recent(slot.name))
-        await send(client, entity, text)
+        to, her = await resolve(client, cfg, recipient, writer)
+        text = await compose(cfg, writer, client, her, slot, state)
+        if text is None:
+            return
+        await send(client, to, text)
         state.record(slot.name, datetime.now(cfg.tz).date(), text)
         log.info("Sent to %s: %s", recipient, text)
     finally:
@@ -296,7 +389,7 @@ def main():
     parser.add_argument("--config", type=Path, default=Path("config.toml"), help="default: config.toml")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--plan", action="store_true", help="show when the next texts will go out, then exit")
-    mode.add_argument("--now", metavar="SLOT", help="send one message from this schedule slot right now")
+    mode.add_argument("--now", metavar="SLOT", help="send one text for this schedule slot right now")
     parser.add_argument("--to", metavar="WHO", help='send to someone else instead, e.g. "me" for your Saved Messages')
     args = parser.parse_args()
 
@@ -310,10 +403,11 @@ def main():
         if args.plan:
             print_plan(cfg, state)
         elif args.now:
-            asyncio.run(send_now(cfg, state, recipient, cfg.slot(args.now)))
+            slot = cfg.slot(args.now)
+            asyncio.run(send_now(cfg, state, make_writer(cfg), recipient, slot))
         else:
             skip_within = None if args.to else cfg.skip_if_texted_within
-            asyncio.run(run_forever(cfg, state, recipient, skip_within))
+            asyncio.run(run_forever(cfg, state, make_writer(cfg), recipient, skip_within))
     except ConfigError as e:
         sys.exit(f"Error: {e}")
     except KeyboardInterrupt:

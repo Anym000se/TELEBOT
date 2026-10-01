@@ -15,6 +15,32 @@ timezone = "America/New_York"
 # text so it doesn't look weird. Set to 0 to always send.
 skip_if_i_texted_within_minutes = 90
 
+[ai]
+# Have Claude write each text instead of picking one from the lists below. It reads
+# your recent chat so the texts fit what's going on ("good luck on the exam today!"),
+# copies how you text, and skips a text if it would land badly (like mid-argument).
+# The lists below are still used as examples, and as a backup if the AI is unreachable.
+enabled = true
+
+# Get a key at https://platform.claude.com, then either put it here or set the
+# ANTHROPIC_API_KEY environment variable.
+# api_key = "sk-ant-..."
+
+# claude-opus-5-5 writes the best texts. claude-sonnet-5-5 costs about half as much.
+model = "claude-opus-5-5"
+
+# Let Claude read the last few days of your chat with her. This sends those messages
+# to Anthropic's API. Set to false and it only uses about_us and the examples.
+read_recent_chat = true
+
+# The more specific this is, the less generic the texts. Fill in the blanks.
+about_us = """
+Her name is ___. I call her ___.
+We've been together ___.
+Things she's into: ___.
+How I text: ___ (e.g. all lowercase, short, barely any emojis)
+"""
+
 # Each [[schedule]] is one text per day, sent at a random time inside `between`
 # (so it's not suspiciously 8:00:00 every morning). A window can run past midnight,
 # e.g. ["23:30", "00:30"]. Add, remove, or rename slots however you like.
