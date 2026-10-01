@@ -1,0 +1,58 @@
+# Copy this file to config.toml and fill it in.
+
+# From https://my.telegram.org > "API development tools" (log in with your own number).
+api_id = 1234567
+api_hash = "your_api_hash"
+
+# Who gets the texts: her @username, or a phone number that's saved in your contacts.
+recipient = "@her_username"
+
+# Times below are in this timezone. Use a name from
+# https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
+timezone = "America/New_York"
+
+# If you've already texted her yourself in the last N minutes, skip the scheduled
+# text so it doesn't look weird. Set to 0 to always send.
+skip_if_i_texted_within_minutes = 90
+
+# Each [[schedule]] is one text per day, sent at a random time inside `between`
+# (so it's not suspiciously 8:00:00 every morning). A window can run past midnight,
+# e.g. ["23:30", "00:30"]. Add, remove, or rename slots however you like.
+#
+# `chance` (optional) is how often the slot fires: 0.5 means about every other day.
+
+[[schedule]]
+name = "good morning"
+between = ["07:30", "09:00"]
+messages = [
+  "good morning beautiful ☀️",
+  "morning babe, hope you slept well",
+  "good morning ❤️ have the best day today",
+  "rise and shine gorgeous",
+  "morning! can't wait to see you",
+  "good morning, you're the first thing on my mind",
+]
+
+[[schedule]]
+name = "thinking of you"
+between = ["12:00", "17:00"]
+chance = 0.5
+messages = [
+  "hey, just thinking about you 🥰",
+  "miss you",
+  "hope your day's going good",
+  "random reminder that I love you",
+  "can't stop thinking about you lol",
+  "you're the best, you know that?",
+]
+
+[[schedule]]
+name = "goodnight"
+between = ["22:30", "23:30"]
+messages = [
+  "goodnight babe ❤️ sweet dreams",
+  "night beautiful, talk tomorrow",
+  "goodnight, love you 😘",
+  "sleep well, dream of me lol",
+  "night night 💤",
+]

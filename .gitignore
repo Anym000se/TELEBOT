@@ -1,0 +1,11 @@
+# Your API keys and her username
+config.toml
+# Your Telegram login. Anyone with this file can use your account.
+*.session
+*.session-journal
+state.json
+state.tmp
+
+__pycache__/
+.venv/
+venv/
