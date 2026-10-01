@@ -337,6 +337,10 @@ async def run_forever(cfg: Config, state: State, writer, recipient: str, skip_wi
             for when, slot in plan_day(day, cfg.slots, cfg.tz, datetime.now(cfg.tz), state):
                 log.info('Next up: "%s" at %s', slot.name, when.strftime("%a %H:%M"))
                 await sleep_until(when)
+                if datetime.now(cfg.tz) > slot.window(day, cfg.tz)[1]:
+                    # The computer was asleep through the whole window. A good-morning text at noon would be weird.
+                    log.info('Missed "%s" (computer was probably asleep), skipping it', slot.name)
+                    continue
                 try:
                     if await texted_recently(client, to, skip_within):
                         log.info('Skipping "%s": you already texted her recently', slot.name)
