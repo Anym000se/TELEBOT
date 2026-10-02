@@ -379,8 +379,11 @@ async def recent_chat(client, her, tz: ZoneInfo) -> list[ChatLine]:
     return chat[::-1]
 
 
-async def compose(cfg: Config, writer, client, her, slot: Slot, state: State) -> str | None:
-    """The text to send for this slot, or None if the AI thinks now's a bad time."""
+async def compose(cfg: Config, writer, client, her, slot: Slot, state: State, preview: bool = False) -> str | None:
+    """The text to send for this slot, or None if the AI thinks now's a bad time.
+
+    In a preview (a test run to yourself) you get the draft either way, with Claude's reason if it would hold it back.
+    """
     recent = state.recent(slot.name)
     if writer is not None:
         chat = await recent_chat(client, her, cfg.tz) if cfg.ai.read_recent_chat else None
@@ -388,6 +391,8 @@ async def compose(cfg: Config, writer, client, her, slot: Slot, state: State) ->
         if draft is not None:
             if not draft.send:
                 log.info('Not sending "%s": %s', slot.name, draft.skip_reason)
+                if preview and draft.message:
+                    return f"{draft.message}\n\n(Preview only. Claude wouldn't send this right now: {draft.skip_reason})"
                 return None
             return draft.message
     return pick_message(slot, recent)
@@ -566,7 +571,7 @@ async def run_forever(cfg: Config, state: State, writer, finder, calendar, recip
                         log.info('Skipping "%s": you already texted her recently', slot.name)
                         state.record(slot.name, day)
                         continue
-                    text = await compose(cfg, writer, client, her, slot, state)
+                    text = await compose(cfg, writer, client, her, slot, state, preview=recipient != cfg.recipient)
                     if text is None:
                         state.record(slot.name, day)
                         continue
@@ -588,7 +593,7 @@ async def send_now(cfg: Config, state: State, writer, recipient: str, slot: Slot
     client = await connect(cfg)
     try:
         to, her = await resolve(client, cfg, recipient, writer is not None and cfg.ai.read_recent_chat)
-        text = await compose(cfg, writer, client, her, slot, state)
+        text = await compose(cfg, writer, client, her, slot, state, preview=recipient != cfg.recipient)
         if text is None:
             return
         await send(client, to, text)
@@ -635,7 +640,8 @@ def main():
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-    logging.getLogger("telethon").setLevel(logging.WARNING)
+    for noisy in ("telethon", "httpx", "httpx2"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     try:
         cfg = load_config(args.config)
         # Test runs with --to don't touch the real state, so they can't use up today's texts.

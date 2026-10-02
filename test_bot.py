@@ -182,6 +182,12 @@ class ComposeTests(unittest.IsolatedAsyncioTestCase):
         writer = FakeWriter(SimpleNamespace(send=False, message="", skip_reason="you two are arguing"))
         self.assertIsNone(await compose(ai_config(), writer, None, None, slot(), State(None)))
 
+    async def test_preview_shows_held_back_draft(self):
+        writer = FakeWriter(SimpleNamespace(send=False, message="have fun at the concert", skip_reason="she's busy"))
+        text = await compose(ai_config(), writer, None, None, slot(), State(None), preview=True)
+        self.assertTrue(text.startswith("have fun at the concert"))
+        self.assertIn("wouldn't send this right now: she's busy", text)
+
     async def test_falls_back_to_list_when_ai_fails(self):
         text = await compose(ai_config(), FakeWriter(None), None, None, slot(messages=["hi"]), State(None))
         self.assertEqual(text, "hi")

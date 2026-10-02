@@ -27,7 +27,7 @@ Set `send` to false and explain in `skip_reason` when a text like this would lan
 right now. For example: we're in the middle of an argument, she's upset and a cheery text \
 would seem tone-deaf, she asked for space, or she said something I haven't replied to and \
 this text would come across as ignoring it. Otherwise set `send` to true and leave \
-`skip_reason` empty.
+`skip_reason` empty. Either way, write the best text you can in `message`.
 
 About us:
 {about_us}"""
