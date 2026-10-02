@@ -102,7 +102,10 @@ def load_config(path: Path) -> Config:
     except FileNotFoundError:
         raise ConfigError(f"{path} not found. Copy config.example.toml to {path.name} and fill it in.") from None
     except tomllib.TOMLDecodeError as e:
-        raise ConfigError(f"{path} isn't valid TOML: {e}") from None
+        raise ConfigError(
+            f"{path} has a mistake: {e}. Check that line. Text like api_hash, recipient, timezone and "
+            'api_key needs "straight quotes" around it; numbers like api_id don\'t.'
+        ) from None
 
     try:
         tz = ZoneInfo(raw.get("timezone", "UTC"))

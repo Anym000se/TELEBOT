@@ -117,6 +117,7 @@ class ConfigTests(unittest.TestCase):
             'recipient = "@x"\n[[schedule]]\nname = "a"\nbetween = ["07:00", "09:00"]\nmessages = []': "at least one message",
             'recipient = "@x"\ntimezone = "Mars/Base"\n[[schedule]]\nname = "a"\nbetween = ["07:00", "09:00"]\nmessages = ["hi"]': "Unknown timezone",
             'recipient = "@x"': "at least one [[schedule]]",
+            'api_hash = 123456abcdef\nrecipient = "@x"': "straight quotes",
         }
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.toml"
