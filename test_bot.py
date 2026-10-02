@@ -367,6 +367,39 @@ class PlanFinderTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(await PlanFinder(mock.client, "m", "").find(at(8), [], [ChatLine(1, at(7), "her", "x")], 1))
 
 
+class FindGoogleCredentialsTests(unittest.TestCase):
+    def test_finds_misnamed_or_original_file(self):
+        from bot import find_google_credentials
+
+        for name in ("google-credentials.json", "google-credentials.json.json", "google-credentials",
+                     "client_secret_123-abc.apps.googleusercontent.com.json"):
+            with TemporaryDirectory() as tmp:
+                folder = Path(tmp)
+                (folder / name).write_text("{}")
+                with self.assertLogs("telebot", "INFO") if name != "google-credentials.json" else _no_logs():
+                    found = find_google_credentials(folder / "google-credentials.json", downloads=folder / "nope")
+                self.assertEqual(found.name, name)
+
+    def test_points_at_downloads(self):
+        from bot import find_google_credentials
+
+        with TemporaryDirectory() as tmp, TemporaryDirectory() as downloads:
+            (Path(downloads) / "client_secret_1.json").write_text("{}")
+            with self.assertRaisesRegex(ConfigError, "(?s)still in your Downloads folder.*client_secret_1.json"):
+                find_google_credentials(Path(tmp) / "google-credentials.json", downloads=Path(downloads))
+            (Path(downloads) / "client_secret_1.json").unlink()
+            with self.assertRaisesRegex(ConfigError, "Download JSON straight away"):
+                find_google_credentials(Path(tmp) / "google-credentials.json", downloads=Path(downloads))
+
+
+class _no_logs:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
 class EventBodyTests(unittest.TestCase):
     now = at(12)
 

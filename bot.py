@@ -341,17 +341,36 @@ def make_ai(cfg: Config):
     return writer, finder
 
 
+def find_google_credentials(expected: Path, downloads: Path | None = None) -> Path:
+    """The Google client file, even if it was saved under the wrong name or left in Downloads."""
+    if expected.is_file():
+        return expected
+    folder = expected.parent
+    # Windows hides file extensions, so renaming it to "google-credentials.json" by hand can give
+    # "google-credentials.json.json". Or it may still have the name Google gave it.
+    for candidate in (folder / f"{expected.name}.json", folder / expected.stem, *sorted(folder.glob("client_secret_*.json"))):
+        if candidate.is_file():
+            log.info("Using %s for the Google sign-in", candidate.name)
+            return candidate
+    downloads = downloads or Path.home() / "Downloads"
+    waiting = sorted(downloads.glob("client_secret_*.json"), key=lambda f: f.stat().st_mtime, reverse=True)
+    if waiting:
+        how = f'It\'s still in your Downloads folder. Move it with:\n  move "{waiting[0]}" "{expected.resolve()}"'
+    else:
+        how = (
+            "Go to https://console.cloud.google.com/auth/clients, create a Desktop app client, and click "
+            f"Download JSON straight away. Then put the file in {folder.resolve()}"
+        )
+    raise ConfigError(f"Calendar sync is on but {expected.name} isn't in {folder.resolve()}.\n{how}")
+
+
 def open_calendar(cfg: Config) -> gcal.GoogleCalendar | None:
     """Signs in to Google Calendar (in a browser, the first time). None if [calendar] is off."""
     if cfg.calendar is None:
         return None
-    if not cfg.calendar.credentials_path.exists():
-        raise ConfigError(
-            f"Calendar sync is on but {cfg.calendar.credentials_path.name} is missing. Follow the "
-            "Google Calendar steps in README.md, or set enabled = false under [calendar]."
-        )
+    credentials_path = find_google_credentials(cfg.calendar.credentials_path)
     try:
-        session = gcal.login(cfg.calendar.credentials_path, cfg.calendar.token_path)
+        session = gcal.login(credentials_path, cfg.calendar.token_path)
     except ImportError:
         raise ConfigError("Google packages aren't installed. Run: python -m pip install -r requirements.txt") from None
     except ValueError:
