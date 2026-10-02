@@ -31,8 +31,9 @@ You need Python 3.11+.
 
 1. **Install:**
    ```sh
-   pip install -r requirements.txt
+   python -m pip install -r requirements.txt
    ```
+   Using `python -m pip` (not just `pip`) makes sure the packages go to the same Python that runs the bot. After getting a newer version of TELEBOT, run it again with `--upgrade` added.
 2. **Get Telegram API keys:** go to https://my.telegram.org, log in with your phone number, open **API development tools**, and create an app (any name works). Copy the `api_id` and `api_hash`.
 3. **Get an Anthropic API key** (for AI mode and calendar sync): create one at https://platform.claude.com and add some credit. Then set it as an environment variable:
    ```sh

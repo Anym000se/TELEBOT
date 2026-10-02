@@ -93,8 +93,22 @@ def new_client(api_key: str | None) -> anthropic.AsyncAnthropic:
     return anthropic.AsyncAnthropic(api_key=api_key) if api_key else anthropic.AsyncAnthropic()
 
 
+# Older SDKs don't support the request options used below.
+MIN_SDK = (1, 11)
+
+
+def sdk_too_old() -> str | None:
+    """The installed anthropic version if it's too old for this bot, else None."""
+    try:
+        if tuple(int(part) for part in anthropic.__version__.split(".")[:2]) < MIN_SDK:
+            return anthropic.__version__
+    except ValueError:
+        pass
+    return None
+
+
 def has_credentials(client: anthropic.AsyncAnthropic) -> bool:
-    return bool(client.api_key or client.auth_token or client.credentials)
+    return bool(client.api_key or client.auth_token or getattr(client, "credentials", None))
 
 
 async def ask(client, model: str, system: str, prompt: str, schema, if_it_fails: str):

@@ -281,6 +281,29 @@ def tomorrow(hhmm=None):
 
 
 @unittest.skipUnless(HAS_ANTHROPIC, "anthropic not installed")
+class SDKTests(unittest.TestCase):
+    def test_version_check(self):
+        import anthropic
+
+        import ai
+
+        real = anthropic.__version__
+        try:
+            anthropic.__version__ = "0.49.0"
+            self.assertEqual(ai.sdk_too_old(), "0.49.0")
+            anthropic.__version__ = "1.11.0"
+            self.assertIsNone(ai.sdk_too_old())
+        finally:
+            anthropic.__version__ = real
+
+    def test_credentials_without_credentials_attribute(self):
+        import ai
+
+        self.assertTrue(ai.has_credentials(SimpleNamespace(api_key="sk-ant-x", auth_token=None)))
+        self.assertFalse(ai.has_credentials(SimpleNamespace(api_key=None, auth_token=None)))
+
+
+@unittest.skipUnless(HAS_ANTHROPIC, "anthropic not installed")
 class PlanFinderTests(unittest.IsolatedAsyncioTestCase):
     async def test_request_and_response(self):
         from ai import PlanFinder

@@ -294,7 +294,12 @@ def make_ai(cfg: Config):
     try:
         import ai
     except ImportError:
-        raise ConfigError("AI packages aren't installed. Run: pip install -r requirements.txt") from None
+        raise ConfigError("AI packages aren't installed. Run: python -m pip install -r requirements.txt") from None
+    if old_version := ai.sdk_too_old():
+        raise ConfigError(
+            f"Your anthropic package is too old ({old_version}). Update it with: "
+            "python -m pip install --upgrade -r requirements.txt"
+        )
     client = ai.new_client(cfg.ai.api_key)
     if not ai.has_credentials(client):
         raise ConfigError(
