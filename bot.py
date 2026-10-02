@@ -701,7 +701,7 @@ def main():
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-    for noisy in ("telethon", "httpx", "httpx2"):
+    for noisy in ("telethon", "httpx", "httpx2", "google_auth_oauthlib"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
     try:
         cfg = load_config(args.config)
