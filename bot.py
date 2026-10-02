@@ -57,6 +57,7 @@ class AIConfig:
     api_key: str | None
     about_us: str
     read_recent_chat: bool
+    read_last_messages: int = 10
     key_hint: str = ""  # what's wrong, if the key looks mistyped in config.toml
 
 
@@ -158,6 +159,9 @@ def load_config(path: Path) -> Config:
         raise ConfigError("Add at least one [[schedule]] section.")
 
     ai_raw = raw.get("ai", {})
+    read_last = ai_raw.get("read_last_messages", 10)
+    if isinstance(read_last, bool) or not isinstance(read_last, int) or not 1 <= read_last <= 100:
+        raise ConfigError("read_last_messages under [ai] should be a number from 1 to 100 (no quotes).")
     api_key = _find_api_key(raw)
     key_hint = ""
     if not api_key and re.search(r"^\s*#\s*api_key\s*=\s*\S*sk-ant-[\w-]{20,}", path.read_text(errors="replace"), re.M):
@@ -168,6 +172,7 @@ def load_config(path: Path) -> Config:
         api_key=api_key,
         about_us=str(ai_raw.get("about_us", "")).strip(),
         read_recent_chat=bool(ai_raw.get("read_recent_chat", True)),
+        read_last_messages=read_last,
         key_hint=key_hint,
     )
 
@@ -367,11 +372,11 @@ class ChatLine(NamedTuple):
     text: str
 
 
-async def recent_chat(client, her, tz: ZoneInfo) -> list[ChatLine]:
-    """The last few days of your chat with her, oldest first."""
+async def recent_chat(client, her, tz: ZoneInfo, limit: int) -> list[ChatLine]:
+    """Your latest `limit` messages with her (never more than 3 days back), oldest first."""
     cutoff = datetime.now(timezone.utc) - timedelta(days=3)
     chat = []
-    async for message in client.iter_messages(her, limit=40):
+    async for message in client.iter_messages(her, limit=limit):
         if message.date < cutoff:
             break
         text = getattr(message, "message", None) or _describe(message)
@@ -386,7 +391,7 @@ async def compose(cfg: Config, writer, client, her, slot: Slot, state: State, pr
     """
     recent = state.recent(slot.name)
     if writer is not None:
-        chat = await recent_chat(client, her, cfg.tz) if cfg.ai.read_recent_chat else None
+        chat = await recent_chat(client, her, cfg.tz, cfg.ai.read_last_messages) if cfg.ai.read_recent_chat else None
         draft = await writer.write(slot.name, slot.messages, datetime.now(cfg.tz), chat, recent)
         if draft is not None:
             if not draft.send:
@@ -485,7 +490,7 @@ class CalendarWatcher:
         With dry_run it reads the whole recent chat and changes nothing.
         """
         async with self._lock:
-            chat = await recent_chat(self.client, self.her, self.cfg.tz)
+            chat = await recent_chat(self.client, self.her, self.cfg.tz, self.cfg.ai.read_last_messages)
             new = chat if dry_run else [line for line in chat if line.id > self.state.calendar_seen]
             if not new:
                 return []

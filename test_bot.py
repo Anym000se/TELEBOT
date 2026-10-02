@@ -99,6 +99,7 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(cfg.ai.read_recent_chat)
         self.assertIn("Her name is", cfg.ai.about_us)
         self.assertTrue(cfg.ai.write_texts)
+        self.assertEqual(cfg.ai.read_last_messages, 10)
         self.assertEqual(cfg.calendar.calendar_id, "primary")
         self.assertTrue(cfg.calendar.notify_me)
         self.assertEqual(cfg.calendar.credentials_path.name, "google-credentials.json")
@@ -137,6 +138,7 @@ class ConfigTests(unittest.TestCase):
             'recipient = "@x"\n[[schedule]]\nname = "a"\nbetween = ["07:00", "09:00"]\nmessages = []': "at least one message",
             'recipient = "@x"\ntimezone = "Mars/Base"\n[[schedule]]\nname = "a"\nbetween = ["07:00", "09:00"]\nmessages = ["hi"]': "Unknown timezone",
             'recipient = "@x"': "at least one [[schedule]]",
+            'recipient = "@x"\n[ai]\nread_last_messages = "5"\n[[schedule]]\nname = "a"\nbetween = ["07:00", "09:00"]\nmessages = ["hi"]': "1 to 100",
             'api_hash = 123456abcdef\nrecipient = "@x"': "straight quotes",
         }
         with TemporaryDirectory() as tmp:
@@ -213,8 +215,10 @@ class ComposeTests(unittest.IsolatedAsyncioTestCase):
             SimpleNamespace(id=2, date=now, out=False, message="second"),
             SimpleNamespace(id=1, date=now - timedelta(hours=1), out=True, message="first"),
         ])
-        chat = await recent_chat(telegram, "her", TZ)
+        chat = await recent_chat(telegram, "her", TZ, limit=10)
         self.assertEqual([(line.id, line.text) for line in chat], [(1, "first"), (2, "second")])
+        chat = await recent_chat(telegram, "her", TZ, limit=1)
+        self.assertEqual([line.text for line in chat], ["second"])  # only the newest
 
 
 class MockClaude:

@@ -30,9 +30,13 @@ enabled = true
 # claude-opus-5-5 writes the best texts. claude-sonnet-5-5 costs about half as much.
 model = "claude-opus-5-5"
 
-# Let Claude read the last few days of your chat with her. This sends those messages
-# to Anthropic's API. Set to false and it only uses about_us and the examples.
+# Let Claude read your latest messages with her. This sends those messages to
+# Anthropic's API. Set to false and it only uses about_us and the examples.
 read_recent_chat = true
+
+# How many of the latest messages it reads (never more than 3 days back).
+# Calendar sync reads the same amount.
+read_last_messages = 10
 
 # The more specific this is, the less generic the texts. Fill in the blanks.
 about_us = """
