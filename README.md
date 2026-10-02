@@ -48,16 +48,20 @@ You need Python 3.11+.
    - Fill in **`about_us`** (her name, what you call her, how you text). This is what makes the AI sound like you and not a greeting card.
    - Edit the **message lists** so they sound like you. With AI on they're used as style examples, and as a backup if Claude can't be reached.
 5. **Set up Google Calendar** (skip this if you set `enabled = false` under `[calendar]`). It's a one-time setup:
-   1. Go to https://console.cloud.google.com, signed in with the Google account whose calendar you want, and create a new project (any name).
-   2. Search the top bar for **Google Calendar API** and click **Enable**.
-   3. Open **Google Auth Platform** (called "OAuth consent screen" in some versions) and click **Get started**. Name the app "TELEBOT", enter your email, choose **External** as the audience, and finish.
-   4. Under **Audience**, click **Publish app**. If you skip this, Google signs the bot out every 7 days. Google will call the app "unverified"; that's normal for something only you use.
-   5. Under **Clients**, create a client of type **Desktop app**, then **Download JSON**. Save the file in the TELEBOT folder as `google-credentials.json`.
-   6. Run:
+   1. Go to https://console.cloud.google.com, signed in with the Google account whose calendar you want. Click the project picker at the top, then **New project**, name it "TELEBOT", and make sure it's selected.
+   2. Open https://console.cloud.google.com/flows/enableapi?apiid=calendar-json.googleapis.com and click **Enable** to turn on the Google Calendar API.
+   3. Open https://console.cloud.google.com/auth/branding and click **Get started**. App name "TELEBOT", your email for support and contact, audience **External**, agree to the policy, then **Create**.
+   4. Open https://console.cloud.google.com/auth/audience and click **Publish app**, then **Confirm**. If you skip this, Google signs the bot out every 7 days. Google will call the app "unverified"; that's normal for something only you use.
+   5. Open https://console.cloud.google.com/auth/clients, click **Create client**, choose **Desktop app**, name it "TELEBOT", and click **Create**. In the box that pops up, click **Download JSON**.
+   6. Move that file into the TELEBOT folder as `google-credentials.json`. On Windows, from the TELEBOT folder:
+      ```
+      move %USERPROFILE%\Downloads\client_secret_*.json google-credentials.json
+      ```
+   7. Run:
       ```sh
       python bot.py --check-calendar
       ```
-      A browser window opens. Sign in and click **Advanced → Go to TELEBOT** (it's your own app, so that warning is about you), then **Allow**. Back in the terminal it asks for your Telegram phone number and the login code Telegram sends you (first time only). Then it shows what it *would* put on your calendar from the last few days of chat. Nothing changes yet.
+      A browser window opens. Pick your Google account. On "Google hasn't verified this app", click **Advanced → Go to TELEBOT** (it's your own app, so that warning is about you). If there's a checkbox for calendar access, **tick it**, then click **Continue**. When the page says you can close it, go back to the terminal. It asks for your Telegram login if it hasn't before, then shows what it *would* put on your calendar from your latest messages. Nothing changes yet.
 6. **Preview the schedule** (this doesn't connect or send anything):
    ```sh
    python bot.py --plan

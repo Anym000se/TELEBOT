@@ -12,6 +12,10 @@ API = "https://www.googleapis.com/calendar/v3"
 TAG = "telebot"
 
 
+class CalendarError(Exception):
+    """Google said no. The message says why, in Google's words."""
+
+
 def login(credentials_path: Path, token_path: Path):
     """An authorized session for the Calendar API. Opens a browser to sign in the first time."""
     from google.auth.transport.requests import AuthorizedSession, Request
@@ -29,6 +33,12 @@ def login(credentials_path: Path, token_path: Path):
     if not creds or not creds.valid:
         flow = InstalledAppFlow.from_client_secrets_file(str(credentials_path), SCOPES)
         creds = flow.run_local_server(port=0)
+        granted = creds.granted_scopes or SCOPES
+        if SCOPES[0] not in (granted.split() if isinstance(granted, str) else granted):
+            raise CalendarError(
+                "Google sign-in didn't include calendar access. Run it again, and on Google's screen tick "
+                "the box that lets TELEBOT view and edit events on your calendars."
+            )
     token_path.write_text(creds.to_json())
     return AuthorizedSession(creds)
 
@@ -103,7 +113,12 @@ class GoogleCalendar:
 
     def _call(self, method: str, url: str, **kwargs):
         response = self.session.request(method, url, timeout=30, **kwargs)
-        response.raise_for_status()
+        if response.status_code >= 400:
+            try:
+                reason = response.json()["error"]["message"]
+            except Exception:
+                reason = response.text[:300]
+            raise CalendarError(f"{reason} (HTTP {response.status_code})")
         return response.json() if response.content else None
 
     def upcoming(self, days: int = 60) -> list[Event]:

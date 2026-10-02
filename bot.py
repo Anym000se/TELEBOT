@@ -353,8 +353,20 @@ def open_calendar(cfg: Config) -> gcal.GoogleCalendar | None:
     try:
         session = gcal.login(cfg.calendar.credentials_path, cfg.calendar.token_path)
     except ImportError:
-        raise ConfigError("Google packages aren't installed. Run: pip install -r requirements.txt") from None
-    return gcal.GoogleCalendar(session, cfg.calendar.calendar_id, cfg.tz)
+        raise ConfigError("Google packages aren't installed. Run: python -m pip install -r requirements.txt") from None
+    except ValueError:
+        raise ConfigError(
+            f"{cfg.calendar.credentials_path.name} doesn't look right. In Google Cloud, create a client of "
+            'type "Desktop app" and download its JSON again.'
+        ) from None
+    except gcal.CalendarError as e:
+        raise ConfigError(str(e)) from None
+    calendar = gcal.GoogleCalendar(session, cfg.calendar.calendar_id, cfg.tz)
+    try:
+        calendar.upcoming(days=1)  # find problems now rather than at the first plan
+    except gcal.CalendarError as e:
+        raise ConfigError(f"Google Calendar isn't working yet. Google says: {e}") from None
+    return calendar
 
 
 def _describe(message) -> str:
@@ -481,6 +493,8 @@ class CalendarWatcher:
     async def _check_safely(self):
         try:
             await self.check()
+        except gcal.CalendarError as e:
+            log.warning("Google Calendar problem, will try again after the next message: %s", e)
         except Exception:
             log.exception("Calendar check failed, will try again after the next message")
 

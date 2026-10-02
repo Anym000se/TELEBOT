@@ -402,25 +402,25 @@ class EventBodyTests(unittest.TestCase):
 
 
 class FakeResponse:
-    def __init__(self, data):
+    def __init__(self, data, status_code=200):
         self.data = data
+        self.status_code = status_code
         self.content = json.dumps(data).encode() if data is not None else b""
-
-    def raise_for_status(self):
-        pass
+        self.text = self.content.decode()
 
     def json(self):
         return self.data
 
 
 class FakeSession:
-    def __init__(self, reply=None):
+    def __init__(self, reply=None, status_code=200):
         self.calls = []
         self.reply = reply
+        self.status_code = status_code
 
     def request(self, method, url, **kwargs):
         self.calls.append((method, url, kwargs))
-        return FakeResponse(self.reply)
+        return FakeResponse(self.reply, self.status_code)
 
 
 class GoogleCalendarTests(unittest.TestCase):
@@ -440,6 +440,11 @@ class GoogleCalendarTests(unittest.TestCase):
         method, url, kwargs = session.calls[0]
         self.assertEqual((method, url), ("GET", "https://www.googleapis.com/calendar/v3/calendars/me%40gmail.com/events"))
         self.assertEqual(kwargs["params"]["singleEvents"], "true")
+
+    def test_errors_say_what_google_said(self):
+        session = FakeSession({"error": {"code": 403, "message": "Google Calendar API has not been used in project 123"}}, 403)
+        with self.assertRaisesRegex(gcal.CalendarError, "has not been used in project 123 \\(HTTP 403\\)"):
+            gcal.GoogleCalendar(session, "primary", TZ).upcoming()
 
     def test_add_update_cancel(self):
         session = FakeSession({"id": "new1"})
