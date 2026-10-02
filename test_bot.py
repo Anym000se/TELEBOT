@@ -343,7 +343,7 @@ class PlanFinderTests(unittest.IsolatedAsyncioTestCase):
         from ai import PlanFinder
 
         change = {"action": "add", "event_id": "", "title": "Dinner at Luigi's", "start": "2026-10-03T19:00",
-                  "end": "", "location": "Luigi's", "quote": "luigi's saturday at 7?"}
+                  "end": "", "time_was_said": True, "location": "Luigi's", "quote": "luigi's saturday at 7?"}
         mock = MockClaude(body=MockClaude.reply({"changes": [change]}))
         finder = PlanFinder(mock.client, "claude-opus-5-5", "Her name is Sam.")
         upcoming = [
@@ -356,6 +356,7 @@ class PlanFinderTests(unittest.IsolatedAsyncioTestCase):
 
         sent = json.loads(mock.requests[0].content)
         self.assertEqual(sent["output_config"]["format"]["type"], "json_schema")
+        self.assertIn("time_was_said", json.dumps(sent["output_config"]["format"]["schema"]))
         prompt = sent["messages"][0]["content"]
         self.assertIn("Now: Thursday, October 1, 2026, 6:05pm (America/New_York)", prompt)
         self.assertIn("- Movie night: 2026-10-05T20:00 to 2026-10-05T22:00 [id: abc]", prompt)
@@ -593,8 +594,9 @@ class ChatWithNotes(FakeTelegram):
         self.notes.append((to, text))
 
 
-def change(action="add", event_id="", title="", start="", end="", location="", quote=""):
-    return SimpleNamespace(action=action, event_id=event_id, title=title, start=start, end=end, location=location, quote=quote)
+def change(action="add", event_id="", title="", start="", end="", location="", quote="", time_was_said=True):
+    return SimpleNamespace(action=action, event_id=event_id, title=title, start=start, end=end, location=location,
+                           quote=quote, time_was_said=time_was_said)
 
 
 class CalendarWatcherTests(unittest.IsolatedAsyncioTestCase):
@@ -673,6 +675,22 @@ class CalendarWatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((event_id, body["summary"]), ("ours1", "Movie night"))  # kept the old title
         self.assertTrue(body["start"]["dateTime"].endswith("T21:00:00"))
         self.assertEqual(self.calendar.cancelled, [])
+
+    async def test_made_up_time_becomes_all_day(self):
+        watcher = self.watcher([change(title="Aquarium", start=tomorrow("14:00"), time_was_said=False, quote="aquarium later")])
+        with self.assertLogs("telebot", "INFO"):
+            await watcher.check()
+        body = self.calendar.added[0]
+        self.assertEqual((body["start"], body["end"]), ({"date": tomorrow()}, {"date": (date.fromisoformat(tomorrow()) + timedelta(days=1)).isoformat()}))
+
+    async def test_moving_to_another_day_keeps_the_time(self):
+        day_after = (date.fromisoformat(tomorrow()) + timedelta(days=1)).isoformat()
+        watcher = self.watcher([change("update", "ours1", start=day_after, time_was_said=False, quote="sunday instead?")])
+        with self.assertLogs("telebot", "INFO"):
+            await watcher.check()
+        _, body = self.calendar.updated[0]
+        self.assertEqual(body["start"]["dateTime"], f"{day_after}T20:00:00")
+        self.assertEqual(body["end"]["dateTime"], f"{day_after}T22:00:00")
 
     async def test_cancel(self):
         with self.assertLogs("telebot", "INFO"):

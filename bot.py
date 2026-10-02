@@ -597,12 +597,19 @@ class CalendarWatcher:
             return f"🗑️ Removed from your calendar: {ours[change.event_id].title}{quote}"
 
         title, start, end = change.title, change.start, change.end
+        if not getattr(change, "time_was_said", True):
+            start, end = start[:10], end[:10]  # no time was mentioned, so it's an all-day event
         if change.action == "update":
             # Keep whatever the update didn't mention.
             old = ours[change.event_id]
             title = title or old.title
             if not start:
                 start, end = old.start, end or old.end
+            elif "T" not in start and "T" in old.start:
+                # Moved to another day without a new time ("can we do sunday instead"): keep the old time.
+                day = start
+                start = day + old.start[10:]
+                end = day + old.end[10:] if "T" in old.end else ""
         body = gcal.event_body(title, start, end, change.location, change.quote, self.cfg.tz, now)
         if change.action == "add":
             if not dry_run:

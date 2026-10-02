@@ -59,6 +59,9 @@ How to fill in each change:
 and when no time was mentioned. Work out relative dates ("tomorrow", "next friday", "the \
 12th") from the current date. For an all-day thing spanning several days, `end` is the \
 last day. Leave `end` empty if it wasn't said.
+- `time_was_said`: true only if someone actually said a clock time for it ("2pm", "7:30", \
+"noon"). Words like "later", "tonight" or "after work" don't count. Never guess a time: \
+when this is false, give `start` and `end` as dates only.
 - `location`: if one was mentioned, otherwise empty.
 - `quote`: the message the plan came from, copied word for word.
 - For `cancel`, only `event_id` and `quote` matter; leave the rest empty.
@@ -81,6 +84,7 @@ class CalendarChange(BaseModel):
     title: str
     start: str
     end: str
+    time_was_said: bool
     location: str
     quote: str
 
