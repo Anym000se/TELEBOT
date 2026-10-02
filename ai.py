@@ -1,14 +1,15 @@
-"""Has Claude write each text in your style, based on your recent chat with her."""
+"""The Claude parts: writing texts in your style, and spotting plans in the chat for your calendar."""
 
 import logging
 from datetime import datetime
+from typing import Literal
 
 import anthropic
 from pydantic import BaseModel
 
 log = logging.getLogger("telebot")
 
-SYSTEM_PROMPT = """\
+WRITER_PROMPT = """\
 You write texts that get sent automatically from my Telegram account to my girlfriend. \
 She'll read them as coming from me, so they have to sound like me typing on my phone, \
 not like an AI or a greeting card.
@@ -31,6 +32,42 @@ this text would come across as ignoring it. Otherwise set `send` to true and lea
 About us:
 {about_us}"""
 
+PLANS_PROMPT = """\
+You keep my Google Calendar in sync with plans from my Telegram chat with my girlfriend. \
+Read the new messages (below the "new messages" line; anything above it is only context, \
+and was already handled) and decide whether anything should be added to my calendar, \
+changed, or removed.
+
+Add:
+- Plans we've agreed on: dates, dinners, trips, calls, visits, anything with a day or time.
+- Things she has coming up that I'd want to remember, like her exam, flight, interview, or \
+a party she's going to. Title these so it's clear they're hers, e.g. "Sam's job interview".
+
+Don't add:
+- Ideas or suggestions nobody has agreed to yet ("we should go to the beach sometime"). \
+If one gets confirmed later, you'll see that message then.
+- Anything already on my calendar (listed below), even if it's worded differently.
+- Things that already happened.
+
+Use `update` when a plan that's already on the calendar moved or changed, and `cancel` \
+when it was called off. You can only update or cancel events that show an id. Put that \
+id in `event_id`; leave `event_id` empty for `add`.
+
+How to fill in each change:
+- `title`: short, like a calendar entry ("Dinner at Luigi's", "Movie night", "Sam's flight to Denver").
+- `start` / `end`: local time as YYYY-MM-DDTHH:MM, or just YYYY-MM-DD for all-day things \
+and when no time was mentioned. Work out relative dates ("tomorrow", "next friday", "the \
+12th") from the current date. For an all-day thing spanning several days, `end` is the \
+last day. Leave `end` empty if it wasn't said.
+- `location`: if one was mentioned, otherwise empty.
+- `quote`: the message the plan came from, copied word for word.
+- For `cancel`, only `event_id` and `quote` matter; leave the rest empty.
+
+Most of the time there's nothing to do. Then return an empty list.
+
+About us:
+{about_us}"""
+
 
 class Draft(BaseModel):
     send: bool
@@ -38,51 +75,83 @@ class Draft(BaseModel):
     skip_reason: str
 
 
+class CalendarChange(BaseModel):
+    action: Literal["add", "update", "cancel"]
+    event_id: str
+    title: str
+    start: str
+    end: str
+    location: str
+    quote: str
+
+
+class Plans(BaseModel):
+    changes: list[CalendarChange]
+
+
+def new_client(api_key: str | None) -> anthropic.AsyncAnthropic:
+    return anthropic.AsyncAnthropic(api_key=api_key) if api_key else anthropic.AsyncAnthropic()
+
+
+def has_credentials(client: anthropic.AsyncAnthropic) -> bool:
+    return bool(client.api_key or client.auth_token or client.credentials)
+
+
+async def ask(client, model: str, system: str, prompt: str, schema, if_it_fails: str):
+    """One structured request to Claude. Returns the parsed reply, or None (and logs why) if it fails."""
+    try:
+        response = await client.beta.messages.parse(
+            model=model,
+            max_tokens=16000,
+            output_config={"effort": "medium"},
+            # If the request is ever declined, retry it on Anthropic's recommended fallback model.
+            betas=["server-side-fallback-2026-07-01"],
+            fallbacks="default",
+            system=system,
+            messages=[{"role": "user", "content": prompt}],
+            output_format=schema,
+        )
+    except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as e:
+        log.error("Anthropic rejected your API key (%s), %s", e.message, if_it_fails)
+        return None
+    except anthropic.APIStatusError as e:
+        log.warning("Claude request failed (%s: %s), %s", e.status_code, e.message, if_it_fails)
+        return None
+    except anthropic.APIConnectionError:
+        log.warning("Couldn't reach Claude, %s", if_it_fails)
+        return None
+
+    if response.stop_reason != "end_turn" or response.parsed_output is None:
+        log.warning("Claude didn't finish (stop reason: %s), %s", response.stop_reason, if_it_fails)
+        return None
+    return response.parsed_output
+
+
+def _clock(when: datetime) -> str:
+    return f"{when.hour % 12 or 12}:{when:%M}{'am' if when.hour < 12 else 'pm'}"
+
+
+def _format_chat(chat, first_new_id: int | None = None) -> list[str]:
+    lines = []
+    for line in chat:
+        if line.id == first_new_id:
+            lines.append("--- new messages ---")
+        lines.append(f"[{line.when:%a %b} {line.when.day} {line.when:%H:%M}] {line.who}: {line.text}")
+    return lines
+
+
 class Writer:
-    def __init__(self, model: str, api_key: str | None, about_us: str):
+    def __init__(self, client, model: str, about_us: str):
+        self.client = client
         self.model = model
-        self.system = SYSTEM_PROMPT.format(about_us=about_us or "(nothing provided)")
-        self.client = anthropic.AsyncAnthropic(api_key=api_key) if api_key else anthropic.AsyncAnthropic()
+        self.system = WRITER_PROMPT.format(about_us=about_us or "(nothing provided)")
 
-    def has_credentials(self) -> bool:
-        return bool(self.client.api_key or self.client.auth_token or self.client.credentials)
-
-    async def write(
-        self,
-        slot_name: str,
-        examples: list[str],
-        now: datetime,
-        chat: list[tuple[datetime, str, str]] | None,
-        recent: list[str],
-    ) -> Draft | None:
+    async def write(self, slot_name: str, examples: list[str], now: datetime, chat, recent: list[str]) -> Draft | None:
         """Ask Claude for a text. Returns None if it couldn't, so the caller can fall back to the list."""
         prompt = self._prompt(slot_name, examples, now, chat, recent)
-        try:
-            response = await self.client.beta.messages.parse(
-                model=self.model,
-                max_tokens=16000,
-                output_config={"effort": "medium"},
-                # If the request is ever declined, retry it on Anthropic's recommended fallback model.
-                betas=["server-side-fallback-2026-07-01"],
-                fallbacks="default",
-                system=self.system,
-                messages=[{"role": "user", "content": prompt}],
-                output_format=Draft,
-            )
-        except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as e:
-            log.error("Anthropic rejected your API key (%s), using the message list instead", e.message)
+        draft = await ask(self.client, self.model, self.system, prompt, Draft, "using the message list instead")
+        if draft is None:
             return None
-        except anthropic.APIStatusError as e:
-            log.warning("Claude request failed (%s: %s), using the message list instead", e.status_code, e.message)
-            return None
-        except anthropic.APIConnectionError:
-            log.warning("Couldn't reach Claude, using the message list instead")
-            return None
-
-        if response.stop_reason != "end_turn" or response.parsed_output is None:
-            log.warning("Claude didn't finish a text (stop reason: %s), using the message list instead", response.stop_reason)
-            return None
-        draft = response.parsed_output
         draft.message = draft.message.strip().strip('"').strip()
         if draft.send and not draft.message:
             return None
@@ -90,9 +159,8 @@ class Writer:
 
     @staticmethod
     def _prompt(slot_name, examples, now, chat, recent) -> str:
-        clock = f"{now.hour % 12 or 12}:{now:%M}{'am' if now.hour < 12 else 'pm'}"
         lines = [
-            f'It\'s {now:%A, %B} {now.day}, {clock}. Write my "{slot_name}" text to her.',
+            f'It\'s {now:%A, %B} {now.day}, {_clock(now)}. Write my "{slot_name}" text to her.',
             "",
             "Examples of the kind of thing I send for this:",
             *(f"- {m}" for m in examples),
@@ -106,5 +174,31 @@ class Writer:
             lines.append("(No messages between us in the last few days.)")
         else:
             lines.append("Our recent chat, oldest first:")
-            lines += [f"[{when.strftime('%a %H:%M')}] {who}: {text}" for when, who, text in chat]
+            lines += _format_chat(chat)
+        return "\n".join(lines)
+
+
+class PlanFinder:
+    def __init__(self, client, model: str, about_us: str):
+        self.client = client
+        self.model = model
+        self.system = PLANS_PROMPT.format(about_us=about_us or "(nothing provided)")
+
+    async def find(self, now: datetime, upcoming, chat, first_new_id: int) -> list[CalendarChange] | None:
+        """What to change on the calendar, based on the new messages. None if Claude couldn't be asked."""
+        prompt = self._prompt(now, upcoming, chat, first_new_id)
+        plans = await ask(self.client, self.model, self.system, prompt, Plans, "will check again after the next message")
+        return None if plans is None else plans.changes
+
+    @staticmethod
+    def _prompt(now, upcoming, chat, first_new_id) -> str:
+        lines = [f"Now: {now:%A, %B} {now.day}, {now.year}, {_clock(now)} ({now.tzinfo})", ""]
+        lines.append("Already on my calendar (next 60 days):")
+        for event in upcoming:
+            span = event.start if not event.end else f"{event.start} to {event.end}"
+            ref = f" [id: {event.id}]" if event.ours else ""
+            lines.append(f"- {event.title}: {span}{ref}")
+        if not upcoming:
+            lines.append("(nothing)")
+        lines += ["", "Our chat, oldest first:", *_format_chat(chat, first_new_id)]
         return "\n".join(lines)

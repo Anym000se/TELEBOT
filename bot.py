@@ -6,8 +6,10 @@ Setup is in README.md. Quick reference:
     python bot.py --plan                  # preview when texts will go out (sends nothing)
     python bot.py --now "good morning"    # send one text from that slot right now
     python bot.py --now "good morning" --to me   # same, but to your Saved Messages
+    python bot.py --check-calendar        # show what it would put on your calendar (changes nothing)
 
-With [ai] turned on in config.toml, Claude writes each text (see ai.py).
+With [ai] turned on in config.toml, Claude writes each text (see ai.py). With [calendar]
+turned on, plans you make in the chat go on your Google Calendar (see gcal.py).
 """
 
 import argparse
@@ -15,12 +17,16 @@ import asyncio
 import json
 import logging
 import random
+import re
 import sys
 import tomllib
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
+from typing import NamedTuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+import gcal
 
 log = logging.getLogger("telebot")
 
@@ -46,10 +52,19 @@ class Slot:
 
 @dataclass
 class AIConfig:
+    write_texts: bool
     model: str
     api_key: str | None
     about_us: str
     read_recent_chat: bool
+
+
+@dataclass
+class CalendarConfig:
+    calendar_id: str
+    notify_me: bool
+    credentials_path: Path
+    token_path: Path
 
 
 @dataclass
@@ -62,7 +77,8 @@ class Config:
     skip_if_texted_within: timedelta | None
     session_path: Path
     state_path: Path
-    ai: AIConfig | None = None
+    ai: AIConfig
+    calendar: CalendarConfig | None = None
 
     def slot(self, name: str) -> Slot:
         for slot in self.slots:
@@ -120,14 +136,23 @@ def load_config(path: Path) -> Config:
     if not slots:
         raise ConfigError("Add at least one [[schedule]] section.")
 
-    ai = None
     ai_raw = raw.get("ai", {})
-    if ai_raw.get("enabled", False):
-        ai = AIConfig(
-            model=str(ai_raw.get("model") or "claude-opus-5-5"),
-            api_key=ai_raw.get("api_key") or None,
-            about_us=str(ai_raw.get("about_us", "")).strip(),
-            read_recent_chat=bool(ai_raw.get("read_recent_chat", True)),
+    ai = AIConfig(
+        write_texts=bool(ai_raw.get("enabled", False)),
+        model=str(ai_raw.get("model") or "claude-opus-5-5"),
+        api_key=ai_raw.get("api_key") or None,
+        about_us=str(ai_raw.get("about_us", "")).strip(),
+        read_recent_chat=bool(ai_raw.get("read_recent_chat", True)),
+    )
+
+    calendar = None
+    calendar_raw = raw.get("calendar", {})
+    if calendar_raw.get("enabled", False):
+        calendar = CalendarConfig(
+            calendar_id=str(calendar_raw.get("calendar_id") or "primary"),
+            notify_me=bool(calendar_raw.get("notify_me", True)),
+            credentials_path=path.parent / "google-credentials.json",
+            token_path=path.parent / "google-token.json",
         )
 
     skip_minutes = float(raw.get("skip_if_i_texted_within_minutes", 0))
@@ -141,6 +166,7 @@ def load_config(path: Path) -> Config:
         session_path=path.parent / "telebot",
         state_path=path.parent / "state.json",
         ai=ai,
+        calendar=calendar,
     )
 
 
@@ -170,6 +196,19 @@ class State:
             recent = self.data["recent"].setdefault(slot, [])
             recent.append(message)
             del recent[:-50]
+        self.save()
+
+    @property
+    def calendar_seen(self) -> int:
+        """The newest message already checked for plans."""
+        return self.data.get("calendar_seen", 0)
+
+    @calendar_seen.setter
+    def calendar_seen(self, message_id: int):
+        self.data["calendar_seen"] = message_id
+        self.save()
+
+    def save(self):
         if self.path:
             tmp = self.path.with_suffix(".tmp")
             tmp.write_text(json.dumps(self.data, indent=2, ensure_ascii=False))
@@ -237,32 +276,49 @@ async def find(client, who: str):
         ) from None
 
 
-async def resolve(client, cfg: Config, recipient: str, writer):
-    """Who the texts go to, and her chat (for the AI to read). They differ only for test runs with --to."""
+async def resolve(client, cfg: Config, recipient: str, needs_her: bool):
+    """Who the texts go to, and her chat (to read). They differ only for test runs with --to."""
     to = await find(client, recipient)
     if recipient == cfg.recipient:
         return to, to
-    reads_chat = writer is not None and cfg.ai.read_recent_chat
-    return to, (await find(client, cfg.recipient) if reads_chat else None)
+    return to, (await find(client, cfg.recipient) if needs_her else None)
 
 
-def make_writer(cfg: Config):
-    """The AI that writes the texts, or None if [ai] is turned off."""
-    if cfg.ai is None:
-        return None
+def make_ai(cfg: Config):
+    """Claude, as (text writer, plan finder). Each is None if the feature using it is off."""
+    if not cfg.ai.write_texts and cfg.calendar is None:
+        return None, None
     try:
-        from ai import Writer
+        import ai
     except ImportError:
-        raise ConfigError("AI is on but its packages aren't installed. Run: pip install -r requirements.txt") from None
-    writer = Writer(cfg.ai.model, cfg.ai.api_key, cfg.ai.about_us)
-    if not writer.has_credentials():
+        raise ConfigError("AI packages aren't installed. Run: pip install -r requirements.txt") from None
+    client = ai.new_client(cfg.ai.api_key)
+    if not ai.has_credentials(client):
         raise ConfigError(
-            "AI is on but there's no Anthropic API key. Set the ANTHROPIC_API_KEY environment "
-            "variable, or api_key under [ai] in config.toml (or set enabled = false)."
+            "There's no Anthropic API key (AI texts and the calendar both need one). Set the "
+            "ANTHROPIC_API_KEY environment variable, or api_key under [ai] in config.toml."
         )
     if "___" in cfg.ai.about_us:
-        log.warning("Tip: fill in about_us under [ai] in config.toml so the texts sound like you two")
-    return writer
+        log.warning("Tip: fill in about_us under [ai] in config.toml so Claude knows who's who")
+    writer = ai.Writer(client, cfg.ai.model, cfg.ai.about_us) if cfg.ai.write_texts else None
+    finder = ai.PlanFinder(client, cfg.ai.model, cfg.ai.about_us) if cfg.calendar else None
+    return writer, finder
+
+
+def open_calendar(cfg: Config) -> gcal.GoogleCalendar | None:
+    """Signs in to Google Calendar (in a browser, the first time). None if [calendar] is off."""
+    if cfg.calendar is None:
+        return None
+    if not cfg.calendar.credentials_path.exists():
+        raise ConfigError(
+            f"Calendar sync is on but {cfg.calendar.credentials_path.name} is missing. Follow the "
+            "Google Calendar steps in README.md, or set enabled = false under [calendar]."
+        )
+    try:
+        session = gcal.login(cfg.calendar.credentials_path, cfg.calendar.token_path)
+    except ImportError:
+        raise ConfigError("Google packages aren't installed. Run: pip install -r requirements.txt") from None
+    return gcal.GoogleCalendar(session, cfg.calendar.calendar_id, cfg.tz)
 
 
 def _describe(message) -> str:
@@ -273,7 +329,14 @@ def _describe(message) -> str:
     return "[non-text message]"
 
 
-async def recent_chat(client, her, tz: ZoneInfo) -> list[tuple[datetime, str, str]]:
+class ChatLine(NamedTuple):
+    id: int
+    when: datetime
+    who: str  # "me" or "her"
+    text: str
+
+
+async def recent_chat(client, her, tz: ZoneInfo) -> list[ChatLine]:
     """The last few days of your chat with her, oldest first."""
     cutoff = datetime.now(timezone.utc) - timedelta(days=3)
     chat = []
@@ -281,7 +344,7 @@ async def recent_chat(client, her, tz: ZoneInfo) -> list[tuple[datetime, str, st
         if message.date < cutoff:
             break
         text = getattr(message, "message", None) or _describe(message)
-        chat.append((message.date.astimezone(tz), "me" if message.out else "her", text))
+        chat.append(ChatLine(message.id, message.date.astimezone(tz), "me" if message.out else "her", text))
     return chat[::-1]
 
 
@@ -317,8 +380,7 @@ async def send(client, entity, text: str):
             # Show "typing..." for a few seconds first, like a person would.
             async with client.action(entity, "typing"):
                 await asyncio.sleep(min(2 + len(text) * 0.08, 10))
-            await client.send_message(entity, text)
-            return
+            return await client.send_message(entity, text)
         except ConnectionError:
             if attempt == 2:
                 raise
@@ -326,11 +388,138 @@ async def send(client, entity, text: str):
             await asyncio.sleep(30)
 
 
-async def run_forever(cfg: Config, state: State, writer, recipient: str, skip_within: timedelta | None):
+# Messages worth asking Claude about for the calendar: anything mentioning a day, a time, or a
+# plan. It's deliberately generous; its only job is to skip the "lol"s and "love you"s for free.
+PLAN_HINTS = re.compile(
+    r"\d|\b(today|tonight|tm?rw|tomorrow|weekend|week|month|morning|afternoon|evening|noon|midnight"
+    r"|(mon|tues?|wed(nes)?|thu(rs?)?|fri|sat(ur)?|sun)(day)?"
+    r"|jan|feb|mar|apr|may|jun|jul|aug|sept?|oct|nov|dec|january|february|march|april|june|july"
+    r"|august|september|october|november|december|am|pm|o'?clock"
+    r"|dinner|lunch|brunch|breakfast|drinks|date|movies?|party|flight|trip|appointment|meeting"
+    r"|exam|interview|birthday|concert|reservation|tickets|booked|plans?"
+    r"|cancel\w*|reschedul\w*|postpon\w*|instead|can'?t make|rain ?check)\b",
+    re.IGNORECASE,
+)
+
+
+class CalendarWatcher:
+    """Watches your chat with her and keeps your Google Calendar in sync with the plans you make."""
+
+    # Wait for the conversation to pause before reading it, so "dinner friday?" / "yes! 7?" /
+    # "perfect" becomes one event instead of three guesses.
+    quiet_seconds = 180
+
+    def __init__(self, cfg: Config, client, her, finder, calendar: gcal.GoogleCalendar, state: State):
+        self.cfg, self.client, self.her = cfg, client, her
+        self.finder, self.calendar, self.state = finder, calendar, state
+        self.ignore: set[int] = set()  # ids of the bot's own texts, which never contain plans
+        self._timer = None
+        self._lock = asyncio.Lock()
+        self._tasks: set[asyncio.Task] = set()
+
+    def start(self):
+        from telethon import events
+
+        self.client.add_event_handler(self._on_message, events.NewMessage(chats=self.her))
+        self._schedule(0)  # catch up on anything said while the bot was off
+
+    async def _on_message(self, event):
+        if event.message.id not in self.ignore:
+            self._schedule(self.quiet_seconds)
+
+    def _schedule(self, delay: float):
+        if self._timer:
+            self._timer.cancel()
+        self._timer = asyncio.get_running_loop().call_later(delay, self._fire)
+
+    def _fire(self):
+        task = asyncio.create_task(self._check_safely())
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _check_safely(self):
+        try:
+            await self.check()
+        except Exception:
+            log.exception("Calendar check failed, will try again after the next message")
+
+    async def check(self, dry_run: bool = False) -> list[str]:
+        """Look for plans in new messages and update the calendar. Returns what changed, one line each.
+
+        With dry_run it reads the whole recent chat and changes nothing.
+        """
+        async with self._lock:
+            chat = await recent_chat(self.client, self.her, self.cfg.tz)
+            new = chat if dry_run else [line for line in chat if line.id > self.state.calendar_seen]
+            if not new:
+                return []
+            if not dry_run and not any(PLAN_HINTS.search(line.text) for line in new):
+                self.state.calendar_seen = chat[-1].id
+                return []
+            upcoming = await asyncio.to_thread(self.calendar.upcoming)
+            now = datetime.now(self.cfg.tz)
+            changes = await self.finder.find(now, upcoming, chat, new[0].id)
+            if changes is None:
+                return []  # Claude couldn't be reached. These messages get checked again next time.
+            ours = {event.id: event for event in upcoming if event.ours}
+            done = []
+            for change in changes:
+                try:
+                    line = await self._apply(change, ours, now, dry_run)
+                except Exception as e:
+                    log.warning("Couldn't %s %r on the calendar: %s", change.action, change.title or change.event_id, e)
+                    continue
+                if line:
+                    log.info("%s", line.replace("\n", " "))
+                    done.append(line)
+            if not dry_run:
+                self.state.calendar_seen = chat[-1].id
+                if done and self.cfg.calendar.notify_me:
+                    await self.client.send_message("me", "\n\n".join(done))
+            return done
+
+    async def _apply(self, change, ours: dict, now: datetime, dry_run: bool) -> str | None:
+        if change.action != "add" and change.event_id not in ours:
+            log.info("Ignoring a calendar %s for an event the bot didn't create", change.action)
+            return None
+        quote = f'\n"{change.quote}"' if change.quote else ""
+        if change.action == "cancel":
+            if not dry_run:
+                await asyncio.to_thread(self.calendar.cancel, change.event_id)
+            return f"🗑️ Removed from your calendar: {ours[change.event_id].title}{quote}"
+
+        title, start, end = change.title, change.start, change.end
+        if change.action == "update":
+            # Keep whatever the update didn't mention.
+            old = ours[change.event_id]
+            title = title or old.title
+            if not start:
+                start, end = old.start, end or old.end
+        body = gcal.event_body(title, start, end, change.location, change.quote, self.cfg.tz, now)
+        if change.action == "add":
+            if not dry_run:
+                await asyncio.to_thread(self.calendar.add, body)
+            return f"📅 Added to your calendar: {gcal.describe(body)}{quote}"
+        if not dry_run:
+            await asyncio.to_thread(self.calendar.update, change.event_id, body)
+        return f"📅 Updated on your calendar: {gcal.describe(body)}{quote}"
+
+
+async def run_forever(cfg: Config, state: State, writer, finder, calendar, recipient: str, skip_within: timedelta | None):
     client = await connect(cfg)
     try:
-        to, her = await resolve(client, cfg, recipient, writer)
-        log.info("Logged in. Texting %s on schedule%s (Ctrl+C to stop).", recipient, ", AI on" if writer else "")
+        watching = calendar is not None and finder is not None
+        needs_her = (writer is not None and cfg.ai.read_recent_chat) or watching
+        to, her = await resolve(client, cfg, recipient, needs_her)
+        watcher = None
+        if watching:
+            watcher = CalendarWatcher(cfg, client, her, finder, calendar, state)
+            watcher.start()
+        extras = [name for name, on in (("AI texts", writer), ("calendar sync", watcher)) if on]
+        log.info(
+            "Logged in. Texting %s on schedule%s (Ctrl+C to stop).",
+            recipient, f" with {' and '.join(extras)}" if extras else "",
+        )
         # Start from yesterday in case a window that runs past midnight is still open.
         day = datetime.now(cfg.tz).date() - timedelta(days=1)
         while True:
@@ -350,7 +539,9 @@ async def run_forever(cfg: Config, state: State, writer, recipient: str, skip_wi
                     if text is None:
                         state.record(slot.name, day)
                         continue
-                    await send(client, to, text)
+                    sent = await send(client, to, text)
+                    if watcher and sent is not None:
+                        watcher.ignore.add(sent.id)
                 except Exception:
                     log.exception('Failed to send "%s"', slot.name)
                     continue
@@ -365,13 +556,26 @@ async def run_forever(cfg: Config, state: State, writer, recipient: str, skip_wi
 async def send_now(cfg: Config, state: State, writer, recipient: str, slot: Slot):
     client = await connect(cfg)
     try:
-        to, her = await resolve(client, cfg, recipient, writer)
+        to, her = await resolve(client, cfg, recipient, writer is not None and cfg.ai.read_recent_chat)
         text = await compose(cfg, writer, client, her, slot, state)
         if text is None:
             return
         await send(client, to, text)
         state.record(slot.name, datetime.now(cfg.tz).date(), text)
         log.info("Sent to %s: %s", recipient, text)
+    finally:
+        await client.disconnect()
+
+
+async def check_calendar(cfg: Config, finder, calendar: gcal.GoogleCalendar):
+    client = await connect(cfg)
+    try:
+        her = await find(client, cfg.recipient)
+        watcher = CalendarWatcher(cfg, client, her, finder, calendar, State(None))
+        lines = await watcher.check(dry_run=True)
+        print("\nFrom the last few days of chat, it would make these calendar changes:\n")
+        print("\n\n".join(lines) if lines else "(nothing)")
+        print("\nThis was a preview. Nothing was changed.")
     finally:
         await client.disconnect()
 
@@ -394,6 +598,8 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--plan", action="store_true", help="show when the next texts will go out, then exit")
     mode.add_argument("--now", metavar="SLOT", help="send one text for this schedule slot right now")
+    mode.add_argument("--check-calendar", action="store_true",
+                      help="show what it would put on your calendar from the last few days of chat (changes nothing)")
     parser.add_argument("--to", metavar="WHO", help='send to someone else instead, e.g. "me" for your Saved Messages')
     args = parser.parse_args()
 
@@ -408,10 +614,22 @@ def main():
             print_plan(cfg, state)
         elif args.now:
             slot = cfg.slot(args.now)
-            asyncio.run(send_now(cfg, state, make_writer(cfg), recipient, slot))
+            writer, _ = make_ai(cfg)
+            asyncio.run(send_now(cfg, state, writer, recipient, slot))
+        elif args.check_calendar:
+            if cfg.calendar is None:
+                raise ConfigError("Calendar sync is off. Set enabled = true under [calendar] in config.toml.")
+            _, finder = make_ai(cfg)
+            asyncio.run(check_calendar(cfg, finder, open_calendar(cfg)))
         else:
+            writer, finder = make_ai(cfg)
+            calendar = None
+            if args.to and cfg.calendar:
+                log.info("Calendar sync is off during test runs with --to")
+            elif cfg.calendar:
+                calendar = open_calendar(cfg)
             skip_within = None if args.to else cfg.skip_if_texted_within
-            asyncio.run(run_forever(cfg, state, make_writer(cfg), recipient, skip_within))
+            asyncio.run(run_forever(cfg, state, writer, finder, calendar, recipient, skip_within))
     except ConfigError as e:
         sys.exit(f"Error: {e}")
     except KeyboardInterrupt:

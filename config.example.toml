@@ -23,7 +23,8 @@ skip_if_i_texted_within_minutes = 90
 enabled = true
 
 # Get a key at https://platform.claude.com, then either put it here or set the
-# ANTHROPIC_API_KEY environment variable.
+# ANTHROPIC_API_KEY environment variable. Calendar sync below uses this key too,
+# even if enabled = false here.
 # api_key = "sk-ant-..."
 
 # claude-opus-5-5 writes the best texts. claude-sonnet-5-5 costs about half as much.
@@ -40,6 +41,20 @@ We've been together ___.
 Things she's into: ___.
 How I text: ___ (e.g. all lowercase, short, barely any emojis)
 """
+
+[calendar]
+# When you two make plans in the chat ("dinner at luigi's saturday at 7?" / "yes!!"),
+# put them on your Google Calendar, and move or remove them if the plans change.
+# Things she has coming up (her exam, her flight) get added too. Needs a one-time
+# Google setup; see "Google Calendar" in README.md.
+enabled = true
+
+# "primary" is your main calendar. To keep these separate, make a new calendar in
+# Google Calendar and paste its ID here (Settings > that calendar > Integrate calendar).
+calendar_id = "primary"
+
+# Send yourself a note in Saved Messages whenever it adds, moves, or removes something.
+notify_me = true
 
 # Each [[schedule]] is one text per day, sent at a random time inside `between`
 # (so it's not suspiciously 8:00:00 every morning). A window can run past midnight,

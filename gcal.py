@@ -1,0 +1,142 @@
+"""Reads and writes your Google Calendar through Google's REST API."""
+
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from urllib.parse import quote as urlquote
+from zoneinfo import ZoneInfo
+
+SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
+API = "https://www.googleapis.com/calendar/v3"
+# Events the bot creates are tagged, so it only ever changes or removes its own.
+TAG = "telebot"
+
+
+def login(credentials_path: Path, token_path: Path):
+    """An authorized session for the Calendar API. Opens a browser to sign in the first time."""
+    from google.auth.transport.requests import AuthorizedSession, Request
+    from google.oauth2.credentials import Credentials
+    from google_auth_oauthlib.flow import InstalledAppFlow
+
+    creds = None
+    if token_path.exists():
+        creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+    if creds and creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+        except Exception:
+            creds = None  # revoked or expired for good: sign in again
+    if not creds or not creds.valid:
+        flow = InstalledAppFlow.from_client_secrets_file(str(credentials_path), SCOPES)
+        creds = flow.run_local_server(port=0)
+    token_path.write_text(creds.to_json())
+    return AuthorizedSession(creds)
+
+
+@dataclass
+class Event:
+    id: str
+    title: str
+    start: str  # "2026-10-03T19:00", or "2026-10-03" for all-day
+    end: str  # same format; for all-day events, the last day ("" if it's one day)
+    ours: bool  # created by the bot
+
+
+def _parse(value: str) -> datetime | date | None:
+    try:
+        if "T" in value:
+            return datetime.fromisoformat(value).replace(tzinfo=None, second=0, microsecond=0)
+        return date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def event_body(title: str, start: str, end: str, location: str, quote: str, tz: ZoneInfo, now: datetime) -> dict:
+    """The Calendar API body for an event. Raises ValueError if it can't be put on the calendar."""
+    begin, finish = _parse(start), _parse(end)
+    if not title.strip():
+        raise ValueError("no title")
+    if begin is None:
+        raise ValueError(f"couldn't read the start time {start!r}")
+    if isinstance(begin, datetime):
+        if begin.replace(tzinfo=tz) < now:
+            raise ValueError(f"{start} is in the past")
+        if not isinstance(finish, datetime) or finish <= begin:
+            finish = begin + timedelta(hours=1)
+        times = {
+            "start": {"dateTime": begin.isoformat(), "timeZone": tz.key},
+            "end": {"dateTime": finish.isoformat(), "timeZone": tz.key},
+        }
+    else:
+        if begin < now.astimezone(tz).date():
+            raise ValueError(f"{start} is in the past")
+        last = finish if type(finish) is date and finish >= begin else begin
+        # Google's all-day end date is exclusive, so the day after the last day.
+        times = {"start": {"date": begin.isoformat()}, "end": {"date": (last + timedelta(days=1)).isoformat()}}
+    return {
+        "summary": title.strip(),
+        "location": location.strip(),
+        "description": f'From your chat: "{quote.strip()}"\n\nAdded by TELEBOT',
+        **times,
+        "extendedProperties": {"private": {TAG: "1"}},
+    }
+
+
+def describe(body: dict) -> str:
+    """'Dinner at Luigi's, Sat Oct 3, 7:00pm' for notifications."""
+    start = body["start"]
+    if "dateTime" in start:
+        when = datetime.fromisoformat(start["dateTime"])
+        clock = f"{when.hour % 12 or 12}:{when:%M}{'am' if when.hour < 12 else 'pm'}"
+        return f"{body['summary']}, {when:%a %b} {when.day}, {clock}"
+    day = date.fromisoformat(start["date"])
+    last = date.fromisoformat(body["end"]["date"]) - timedelta(days=1)
+    span = f"{day:%a %b} {day.day}" + (f" to {last:%a %b} {last.day}" if last > day else "")
+    return f"{body['summary']}, {span}"
+
+
+class GoogleCalendar:
+    def __init__(self, session, calendar_id: str, tz: ZoneInfo):
+        self.session = session
+        self.tz = tz
+        self.url = f"{API}/calendars/{urlquote(calendar_id, safe='')}/events"
+
+    def _call(self, method: str, url: str, **kwargs):
+        response = self.session.request(method, url, timeout=30, **kwargs)
+        response.raise_for_status()
+        return response.json() if response.content else None
+
+    def upcoming(self, days: int = 60) -> list[Event]:
+        now = datetime.now(timezone.utc)
+        params = {
+            "timeMin": now.isoformat(),
+            "timeMax": (now + timedelta(days=days)).isoformat(),
+            "singleEvents": "true",
+            "orderBy": "startTime",
+            "maxResults": "100",
+        }
+        events = []
+        for item in self._call("GET", self.url, params=params).get("items", []):
+            start, end = item.get("start", {}), item.get("end", {})
+            if "dateTime" in start:
+                begin = self._local(start["dateTime"])
+                finish = self._local(end["dateTime"]) if "dateTime" in end else ""
+            else:
+                begin = start.get("date", "")
+                last = date.fromisoformat(end["date"]) - timedelta(days=1) if "date" in end else None
+                finish = last.isoformat() if last and last.isoformat() != begin else ""
+            ours = item.get("extendedProperties", {}).get("private", {}).get(TAG) == "1"
+            events.append(Event(item["id"], item.get("summary", "(no title)"), begin, finish, ours))
+        return events
+
+    def _local(self, value: str) -> str:
+        return datetime.fromisoformat(value).astimezone(self.tz).strftime("%Y-%m-%dT%H:%M")
+
+    def add(self, body: dict) -> str:
+        return self._call("POST", self.url, json=body)["id"]
+
+    def update(self, event_id: str, body: dict):
+        self._call("PATCH", f"{self.url}/{urlquote(event_id, safe='')}", json=body)
+
+    def cancel(self, event_id: str):
+        self._call("DELETE", f"{self.url}/{urlquote(event_id, safe='')}")

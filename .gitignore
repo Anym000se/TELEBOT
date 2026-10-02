@@ -5,6 +5,9 @@ config.toml
 *.session-journal
 state.json
 state.tmp
+# Your Google login
+google-credentials.json
+google-token.json
 
 __pycache__/
 .venv/
