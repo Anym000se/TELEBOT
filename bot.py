@@ -504,6 +504,7 @@ class CalendarWatcher:
         self.ignore: set[int] = set()  # ids of the bot's own texts, which never contain plans
         self._timer = None
         self._told_signed_out = False
+        self._waiting = False  # a check is scheduled for when the chat goes quiet
         self._lock = asyncio.Lock()
         self._tasks: set[asyncio.Task] = set()
 
@@ -514,8 +515,13 @@ class CalendarWatcher:
         self._schedule(0)  # catch up on anything said while the bot was off
 
     async def _on_message(self, event):
-        if event.message.id not in self.ignore:
-            self._schedule(self.quiet_seconds)
+        if event.message.id in self.ignore:
+            return
+        if not self._waiting:
+            self._waiting = True
+            log.info("Calendar: new message, will check it for plans once the chat is quiet for %d minutes",
+                     self.quiet_seconds // 60)
+        self._schedule(self.quiet_seconds)
 
     def _schedule(self, delay: float):
         if self._timer:
@@ -523,6 +529,7 @@ class CalendarWatcher:
         self._timer = asyncio.get_running_loop().call_later(delay, self._fire)
 
     def _fire(self):
+        self._waiting = False
         task = asyncio.create_task(self._check_safely())
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
@@ -551,8 +558,10 @@ class CalendarWatcher:
             if not new:
                 return []
             if not dry_run and not any(PLAN_HINTS.search(line.text) for line in new):
+                log.info("Calendar: no days, times or plans in %d new message(s), nothing to check", len(new))
                 self.state.calendar_seen = chat[-1].id
                 return []
+            log.info("Calendar: reading %d new message(s) for plans", len(new))
             upcoming = await asyncio.to_thread(self.calendar.upcoming)
             now = datetime.now(self.cfg.tz)
             changes = await self.finder.find(now, upcoming, chat, new[0].id)
@@ -569,6 +578,8 @@ class CalendarWatcher:
                 if line:
                     log.info("%s", line.replace("\n", " "))
                     done.append(line)
+            if not done:
+                log.info("Calendar: nothing to add or change")
             if not dry_run:
                 self.state.calendar_seen = chat[-1].id
                 if done and self.cfg.calendar.notify_me:
@@ -664,10 +675,10 @@ async def send_now(cfg: Config, state: State, writer, recipient: str, slot: Slot
         await client.disconnect()
 
 
-async def check_calendar(cfg: Config, finder, calendar: gcal.GoogleCalendar):
+async def check_calendar(cfg: Config, finder, calendar: gcal.GoogleCalendar, chat_with: str):
     client = await connect(cfg)
     try:
-        her = await find(client, cfg.recipient)
+        her = await find(client, chat_with)
         watcher = CalendarWatcher(cfg, client, her, finder, calendar, State(None))
         lines = await watcher.check(dry_run=True)
         print("\nFrom the last few days of chat, it would make these calendar changes:\n")
@@ -718,7 +729,7 @@ def main():
             if cfg.calendar is None:
                 raise ConfigError("Calendar sync is off. Set enabled = true under [calendar] in config.toml.")
             _, finder = make_ai(cfg)
-            asyncio.run(check_calendar(cfg, finder, open_calendar(cfg)))
+            asyncio.run(check_calendar(cfg, finder, open_calendar(cfg), args.to or cfg.recipient))
         else:
             writer, finder = make_ai(cfg)
             calendar = None

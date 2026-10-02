@@ -711,8 +711,10 @@ class CalendarWatcherTests(unittest.IsolatedAsyncioTestCase):
     async def test_waits_for_the_conversation_to_pause(self):
         watcher = self.watcher([])
         watcher.quiet_seconds = 0.05
-        for message_id in (13, 14):
-            await watcher._on_message(SimpleNamespace(message=SimpleNamespace(id=message_id)))
+        with self.assertLogs("telebot", "INFO") as logs:
+            for message_id in (13, 14):
+                await watcher._on_message(SimpleNamespace(message=SimpleNamespace(id=message_id)))
+        self.assertEqual(len(logs.output), 1)  # says it's waiting once, not per message
         watcher.ignore.add(15)
         await watcher._on_message(SimpleNamespace(message=SimpleNamespace(id=15)))  # the bot's own text
         await asyncio.sleep(0.2)
