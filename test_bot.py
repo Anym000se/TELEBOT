@@ -474,6 +474,14 @@ class GoogleCalendarTests(unittest.TestCase):
         self.assertEqual((method, url), ("GET", "https://www.googleapis.com/calendar/v3/calendars/me%40gmail.com/events"))
         self.assertEqual(kwargs["params"]["singleEvents"], "true")
 
+    def test_expired_sign_in(self):
+        class ExpiredSession:
+            def request(self, *args, **kwargs):
+                raise gcal.RefreshError("invalid_grant: Token has been expired or revoked.")
+
+        with self.assertRaisesRegex(gcal.SignedOut, "every 7 days"):
+            gcal.GoogleCalendar(ExpiredSession(), "primary", TZ).upcoming()
+
     def test_errors_say_what_google_said(self):
         session = FakeSession({"error": {"code": 403, "message": "Google Calendar API has not been used in project 123"}}, 403)
         with self.assertRaisesRegex(gcal.CalendarError, "has not been used in project 123 \\(HTTP 403\\)"):
@@ -629,6 +637,20 @@ class CalendarWatcherTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(await watcher.check(dry_run=True)), 1)
         self.assertEqual(self.finder.calls[0][1], 10)  # reads the whole recent chat
         self.assertEqual((self.calendar.added, self.telegram.notes, self.state.calendar_seen), ([], [], 12))
+
+    async def test_signed_out_tells_me_once(self):
+        def signed_out():
+            raise gcal.SignedOut("Google signed the bot out")
+
+        self.calendar.upcoming = signed_out
+        watcher = self.watcher([])
+        with self.assertLogs("telebot", "WARNING"):
+            await watcher._check_safely()
+            self.state.calendar_seen = 0
+            await watcher._check_safely()
+        [(to, note)] = self.telegram.notes
+        self.assertEqual(to, "me")
+        self.assertIn("Calendar sync has stopped", note)
 
     async def test_waits_for_the_conversation_to_pause(self):
         watcher = self.watcher([])

@@ -51,7 +51,7 @@ You need Python 3.11+.
    1. Go to https://console.cloud.google.com, signed in with the Google account whose calendar you want. Click the project picker at the top, then **New project**, name it "TELEBOT", and make sure it's selected.
    2. Open https://console.cloud.google.com/flows/enableapi?apiid=calendar-json.googleapis.com and click **Enable** to turn on the Google Calendar API.
    3. Open https://console.cloud.google.com/auth/branding and click **Get started**. App name "TELEBOT", your email for support and contact, audience **External**, agree to the policy, then **Create**.
-   4. Open https://console.cloud.google.com/auth/audience and click **Publish app**, then **Confirm**. If you skip this, Google signs the bot out every 7 days. Google will call the app "unverified"; that's normal for something only you use.
+   4. Open https://console.cloud.google.com/auth/audience and click **Publish app**, then **Confirm**. Google will call the app "unverified"; that's normal for something only you use. If it says to finish the Branding page first, or you'd rather not publish, add your Gmail under **Test users** instead. Without one or the other, sign-in fails with "Access blocked". In test mode Google signs the bot out every 7 days; the bot messages you in Saved Messages when that happens, and restarting it signs you back in.
    5. Open https://console.cloud.google.com/auth/clients, click **Create client**, choose **Desktop app**, name it "TELEBOT", and click **Create**. In the box that pops up, click **Download JSON**.
    6. Move that file into the TELEBOT folder as `google-credentials.json`. On Windows, from the TELEBOT folder:
       ```

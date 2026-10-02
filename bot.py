@@ -486,6 +486,7 @@ class CalendarWatcher:
         self.finder, self.calendar, self.state = finder, calendar, state
         self.ignore: set[int] = set()  # ids of the bot's own texts, which never contain plans
         self._timer = None
+        self._told_signed_out = False
         self._lock = asyncio.Lock()
         self._tasks: set[asyncio.Task] = set()
 
@@ -512,6 +513,11 @@ class CalendarWatcher:
     async def _check_safely(self):
         try:
             await self.check()
+        except gcal.SignedOut as e:
+            log.warning("%s", e)
+            if not self._told_signed_out:  # once is enough; the texts keep going either way
+                self._told_signed_out = True
+                await self.client.send_message("me", f"📅 Calendar sync has stopped. {e}")
         except gcal.CalendarError as e:
             log.warning("Google Calendar problem, will try again after the next message: %s", e)
         except Exception:

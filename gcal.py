@@ -6,6 +6,13 @@ from pathlib import Path
 from urllib.parse import quote as urlquote
 from zoneinfo import ZoneInfo
 
+try:
+    from google.auth.exceptions import RefreshError
+except ImportError:  # Google packages not installed; nothing can raise it then
+
+    class RefreshError(Exception):
+        pass
+
 SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
 API = "https://www.googleapis.com/calendar/v3"
 # Events the bot creates are tagged, so it only ever changes or removes its own.
@@ -14,6 +21,10 @@ TAG = "telebot"
 
 class CalendarError(Exception):
     """Google said no. The message says why, in Google's words."""
+
+
+class SignedOut(CalendarError):
+    """The Google sign-in expired or was revoked, so it has to be done again."""
 
 
 def login(credentials_path: Path, token_path: Path):
@@ -112,7 +123,13 @@ class GoogleCalendar:
         self.url = f"{API}/calendars/{urlquote(calendar_id, safe='')}/events"
 
     def _call(self, method: str, url: str, **kwargs):
-        response = self.session.request(method, url, timeout=30, **kwargs)
+        try:
+            response = self.session.request(method, url, timeout=30, **kwargs)
+        except RefreshError:
+            raise SignedOut(
+                "Google signed the bot out of your calendar. While the Google app is in testing mode this "
+                "happens every 7 days. Stop the bot (Ctrl+C) and start it again to sign back in."
+            ) from None
         if response.status_code >= 400:
             try:
                 reason = response.json()["error"]["message"]
