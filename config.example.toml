@@ -55,6 +55,7 @@ enabled = true
 
 # "primary" is your main calendar. To keep these separate, make a new calendar in
 # Google Calendar and paste its ID here (Settings > that calendar > Integrate calendar).
+# With a service-account key, "primary" won't work: put your Gmail address here instead.
 calendar_id = "primary"
 
 # Send yourself a note in Saved Messages whenever it adds, moves, or removes something.

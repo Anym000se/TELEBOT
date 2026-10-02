@@ -62,6 +62,14 @@ You need Python 3.11+.
       python bot.py --check-calendar
       ```
       A browser window opens. Pick your Google account. On "Google hasn't verified this app", click **Advanced → Go to TELEBOT** (it's your own app, so that warning is about you). If there's a checkbox for calendar access, **tick it**, then click **Continue**. When the page says you can close it, go back to the terminal. It asks for your Telegram login if it hasn't before, then shows what it *would* put on your calendar from your latest messages. Nothing changes yet.
+   **If the sign-in won't work** (for example "Access blocked", or Google won't let you add yourself as a test user), use a service account instead. It's a robot Google account that you share your calendar with, so there's no sign-in screen and it never gets signed out:
+   1. In the same project, open https://console.cloud.google.com/iam-admin/serviceaccounts, click **Create service account**, name it "telebot", click **Create and continue**, skip the optional steps, and click **Done**.
+   2. Click the new account, open the **Keys** tab, and choose **Add key → Create new key → JSON → Create**. A file downloads.
+   3. Copy the account's email address. It looks like `telebot@telebot-123456.iam.gserviceaccount.com`.
+   4. In Google Calendar on the web, open **Settings**, click your calendar under "Settings for my calendars", then **Share with specific people or groups → Add people and groups**. Paste that address, choose **Make changes to events**, and click **Send**.
+   5. Move the key into the TELEBOT folder as `google-credentials.json` (on Windows: `move /Y %USERPROFILE%\Downloads\telebot-*.json google-credentials.json`).
+   6. In `config.toml`, set `calendar_id` under `[calendar]` to your Gmail address, e.g. `calendar_id = "you@gmail.com"`.
+   7. Run `python bot.py --check-calendar`. No browser this time.
 6. **Preview the schedule** (this doesn't connect or send anything):
    ```sh
    python bot.py --plan

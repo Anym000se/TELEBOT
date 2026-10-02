@@ -1,5 +1,6 @@
 """Reads and writes your Google Calendar through Google's REST API."""
 
+import json
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -27,9 +28,28 @@ class SignedOut(CalendarError):
     """The Google sign-in expired or was revoked, so it has to be done again."""
 
 
+def service_account_email(credentials_path: Path) -> str | None:
+    """The robot account's address if the file is a service-account key, else None."""
+    try:
+        info = json.loads(credentials_path.read_text())
+    except (OSError, ValueError):
+        return None
+    return info.get("client_email") if isinstance(info, dict) and info.get("type") == "service_account" else None
+
+
 def login(credentials_path: Path, token_path: Path):
-    """An authorized session for the Calendar API. Opens a browser to sign in the first time."""
+    """An authorized session for the Calendar API.
+
+    With a service-account key there's nothing to sign in to: you share your calendar with the
+    robot account instead. With a Desktop app client, a browser opens to sign in the first time.
+    """
     from google.auth.transport.requests import AuthorizedSession, Request
+
+    if service_account_email(credentials_path):
+        from google.oauth2 import service_account
+
+        return AuthorizedSession(service_account.Credentials.from_service_account_file(str(credentials_path), scopes=SCOPES))
+
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
 
@@ -117,15 +137,21 @@ def describe(body: dict) -> str:
 
 
 class GoogleCalendar:
-    def __init__(self, session, calendar_id: str, tz: ZoneInfo):
+    def __init__(self, session, calendar_id: str, tz: ZoneInfo, robot: str | None = None):
         self.session = session
         self.tz = tz
+        self.robot = robot  # the service account's address, if that's how it signs in
         self.url = f"{API}/calendars/{urlquote(calendar_id, safe='')}/events"
 
     def _call(self, method: str, url: str, **kwargs):
         try:
             response = self.session.request(method, url, timeout=30, **kwargs)
-        except RefreshError:
+        except RefreshError as e:
+            if self.robot:
+                raise SignedOut(
+                    f"Google stopped accepting the service-account key ({e}). In Google Cloud, make a new "
+                    f"key for {self.robot}, save it as google-credentials.json, and restart the bot."
+                ) from None
             raise SignedOut(
                 "Google signed the bot out of your calendar. While the Google app is in testing mode this "
                 "happens every 7 days. Stop the bot (Ctrl+C) and start it again to sign back in."

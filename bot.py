@@ -341,19 +341,29 @@ def make_ai(cfg: Config):
     return writer, finder
 
 
+def _is_google_file(path: Path) -> bool:
+    """A Desktop app client file or a service-account key, under the name Google gave it."""
+    if path.name.startswith("client_secret_"):
+        return True
+    return path.is_file() and path.stat().st_size < 20_000 and gcal.service_account_email(path) is not None
+
+
 def find_google_credentials(expected: Path, downloads: Path | None = None) -> Path:
-    """The Google client file, even if it was saved under the wrong name or left in Downloads."""
+    """The Google key file, even if it was saved under the wrong name or left in Downloads."""
     if expected.is_file():
         return expected
     folder = expected.parent
     # Windows hides file extensions, so renaming it to "google-credentials.json" by hand can give
     # "google-credentials.json.json". Or it may still have the name Google gave it.
-    for candidate in (folder / f"{expected.name}.json", folder / expected.stem, *sorted(folder.glob("client_secret_*.json"))):
+    others = [f for f in sorted(folder.glob("*.json")) if _is_google_file(f)]
+    for candidate in (folder / f"{expected.name}.json", folder / expected.stem, *others):
         if candidate.is_file():
             log.info("Using %s for the Google sign-in", candidate.name)
             return candidate
     downloads = downloads or Path.home() / "Downloads"
-    waiting = sorted(downloads.glob("client_secret_*.json"), key=lambda f: f.stat().st_mtime, reverse=True)
+    waiting = sorted(
+        (f for f in downloads.glob("*.json") if _is_google_file(f)), key=lambda f: f.stat().st_mtime, reverse=True
+    )
     if waiting:
         how = f'It\'s still in your Downloads folder. Move it with:\n  move "{waiting[0]}" "{expected.resolve()}"'
     else:
@@ -369,6 +379,13 @@ def open_calendar(cfg: Config) -> gcal.GoogleCalendar | None:
     if cfg.calendar is None:
         return None
     credentials_path = find_google_credentials(cfg.calendar.credentials_path)
+    robot = gcal.service_account_email(credentials_path)
+    share = f'In Google Calendar, share your calendar with {robot} and pick "Make changes to events".'
+    if robot and cfg.calendar.calendar_id == "primary":
+        raise ConfigError(
+            "You're using a service account, so set calendar_id under [calendar] in config.toml to your "
+            f'Gmail address, like: calendar_id = "you@gmail.com". {share}'
+        )
     try:
         session = gcal.login(credentials_path, cfg.calendar.token_path)
     except ImportError:
@@ -380,11 +397,11 @@ def open_calendar(cfg: Config) -> gcal.GoogleCalendar | None:
         ) from None
     except gcal.CalendarError as e:
         raise ConfigError(str(e)) from None
-    calendar = gcal.GoogleCalendar(session, cfg.calendar.calendar_id, cfg.tz)
+    calendar = gcal.GoogleCalendar(session, cfg.calendar.calendar_id, cfg.tz, robot)
     try:
         calendar.upcoming(days=1)  # find problems now rather than at the first plan
     except gcal.CalendarError as e:
-        raise ConfigError(f"Google Calendar isn't working yet. Google says: {e}") from None
+        raise ConfigError(f"Google Calendar isn't working yet. Google says: {e}" + (f"\n{share}" if robot else "")) from None
     return calendar
 
 

@@ -15,6 +15,10 @@ from bot import (
 )
 
 HAS_ANTHROPIC = importlib.util.find_spec("anthropic") is not None
+try:
+    HAS_GOOGLE = importlib.util.find_spec("google.oauth2") is not None
+except ModuleNotFoundError:
+    HAS_GOOGLE = False
 
 TZ = ZoneInfo("America/New_York")
 DAY = date(2026, 10, 1)
@@ -388,8 +392,60 @@ class FindGoogleCredentialsTests(unittest.TestCase):
             with self.assertRaisesRegex(ConfigError, "(?s)still in your Downloads folder.*client_secret_1.json"):
                 find_google_credentials(Path(tmp) / "google-credentials.json", downloads=Path(downloads))
             (Path(downloads) / "client_secret_1.json").unlink()
+            key = {"type": "service_account", "client_email": "telebot@telebot-1.iam.gserviceaccount.com"}
+            (Path(downloads) / "telebot-1-0123456789ab.json").write_text(json.dumps(key))
+            (Path(downloads) / "unrelated.json").write_text("{}")
+            with self.assertRaisesRegex(ConfigError, "(?s)still in your Downloads folder.*telebot-1-0123456789ab.json"):
+                find_google_credentials(Path(tmp) / "google-credentials.json", downloads=Path(downloads))
+            (Path(downloads) / "telebot-1-0123456789ab.json").unlink()
             with self.assertRaisesRegex(ConfigError, "Download JSON straight away"):
                 find_google_credentials(Path(tmp) / "google-credentials.json", downloads=Path(downloads))
+
+
+class ServiceAccountTests(unittest.TestCase):
+    def key(self, folder, **extra):
+        path = Path(folder) / "google-credentials.json"
+        path.write_text(json.dumps({"type": "service_account", "client_email": "telebot@telebot-1.iam.gserviceaccount.com", **extra}))
+        return path
+
+    def test_detects_service_account_key(self):
+        with TemporaryDirectory() as tmp:
+            self.assertEqual(gcal.service_account_email(self.key(tmp)), "telebot@telebot-1.iam.gserviceaccount.com")
+            (Path(tmp) / "client.json").write_text('{"installed": {}}')
+            self.assertIsNone(gcal.service_account_email(Path(tmp) / "client.json"))
+            self.assertIsNone(gcal.service_account_email(Path(tmp) / "missing.json"))
+
+    @unittest.skipUnless(HAS_GOOGLE, "google-auth not installed")
+    def test_signs_in_with_the_key(self):
+        import rsa
+        from google.oauth2 import service_account
+
+        _, private = rsa.newkeys(1024)
+        with TemporaryDirectory() as tmp:
+            path = self.key(tmp, private_key=private.save_pkcs1().decode(), private_key_id="1",
+                            token_uri="https://oauth2.googleapis.com/token", project_id="telebot-1", client_id="1")
+            session = gcal.login(path, Path(tmp) / "google-token.json")
+            self.assertIsInstance(session.credentials, service_account.Credentials)
+            self.assertEqual(session.credentials.service_account_email, "telebot@telebot-1.iam.gserviceaccount.com")
+            self.assertFalse((Path(tmp) / "google-token.json").exists())  # nothing to remember
+
+    def test_rejected_key_message(self):
+        class Rejected:
+            def request(self, *args, **kwargs):
+                raise gcal.RefreshError("invalid_grant: Invalid JWT Signature.")
+
+        with self.assertRaisesRegex(gcal.SignedOut, "make a new key for telebot@"):
+            gcal.GoogleCalendar(Rejected(), "me@gmail.com", TZ, robot="telebot@telebot-1.iam.gserviceaccount.com").upcoming()
+
+    def test_needs_real_calendar_id(self):
+        from bot import CalendarConfig, open_calendar
+
+        with TemporaryDirectory() as tmp:
+            path = self.key(tmp)
+            cfg = ai_config()
+            cfg.calendar = CalendarConfig("primary", True, path, Path(tmp) / "google-token.json")
+            with self.assertRaisesRegex(ConfigError, "(?s)calendar_id.*Gmail address.*share your calendar with telebot@"):
+                open_calendar(cfg)
 
 
 class _no_logs:
