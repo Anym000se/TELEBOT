@@ -57,6 +57,7 @@ class AIConfig:
     api_key: str | None
     about_us: str
     read_recent_chat: bool
+    key_hint: str = ""  # what's wrong, if the key looks mistyped in config.toml
 
 
 @dataclass
@@ -95,6 +96,17 @@ def _parse_time(value, slot_name: str) -> time:
         raise ConfigError(f'"{slot_name}": couldn\'t read time {value!r}, use "HH:MM" like "07:30"') from None
 
 
+def _find_api_key(raw: dict) -> str | None:
+    """The Anthropic key from [ai], or from wherever it got pasted by mistake.
+
+    A line added at the bottom of the file belongs to the last section, so look there too.
+    """
+    for place in (raw.get("ai", {}), raw, raw.get("calendar", {}), *raw.get("schedule", [])):
+        if isinstance(place, dict) and str(place.get("api_key", "")).strip():
+            return str(place["api_key"]).strip()
+    return None
+
+
 def load_config(path: Path) -> Config:
     try:
         with path.open("rb") as f:
@@ -106,6 +118,12 @@ def load_config(path: Path) -> Config:
             f"{path} has a mistake: {e}. Check that line. Text like api_hash, recipient, timezone and "
             'api_key needs "straight quotes" around it; numbers like api_id don\'t.'
         ) from None
+
+    if str(raw.get("api_hash", "")).strip().startswith("sk-ant"):
+        raise ConfigError(
+            "api_hash has your Anthropic key in it (it starts with sk-ant-). Move it to api_key under "
+            "[ai]. api_hash is the Telegram one from my.telegram.org."
+        )
 
     try:
         tz = ZoneInfo(raw.get("timezone", "UTC"))
@@ -140,12 +158,17 @@ def load_config(path: Path) -> Config:
         raise ConfigError("Add at least one [[schedule]] section.")
 
     ai_raw = raw.get("ai", {})
+    api_key = _find_api_key(raw)
+    key_hint = ""
+    if not api_key and re.search(r"^\s*#\s*api_key\s*=\s*\S*sk-ant-[\w-]{20,}", path.read_text(errors="replace"), re.M):
+        key_hint = ' Your key is in config.toml, but its line starts with "#", which switches it off. Delete the #.'
     ai = AIConfig(
         write_texts=bool(ai_raw.get("enabled", False)),
         model=str(ai_raw.get("model") or "claude-opus-5-5"),
-        api_key=ai_raw.get("api_key") or None,
+        api_key=api_key,
         about_us=str(ai_raw.get("about_us", "")).strip(),
         read_recent_chat=bool(ai_raw.get("read_recent_chat", True)),
+        key_hint=key_hint,
     )
 
     calendar = None
@@ -303,8 +326,8 @@ def make_ai(cfg: Config):
     client = ai.new_client(cfg.ai.api_key)
     if not ai.has_credentials(client):
         raise ConfigError(
-            "There's no Anthropic API key (AI texts and the calendar both need one). Set the "
-            "ANTHROPIC_API_KEY environment variable, or api_key under [ai] in config.toml."
+            "There's no Anthropic API key (AI texts and the calendar both need one). Put it under "
+            '[ai] in config.toml as: api_key = "sk-ant-..."' + cfg.ai.key_hint
         )
     if "___" in cfg.ai.about_us:
         log.warning("Tip: fill in about_us under [ai] in config.toml so Claude knows who's who")

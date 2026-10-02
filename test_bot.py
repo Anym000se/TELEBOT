@@ -111,6 +111,26 @@ class ConfigTests(unittest.TestCase):
             self.assertFalse(cfg.ai.write_texts)
             self.assertIsNone(cfg.calendar)
 
+    def test_api_key_found_in_the_wrong_place(self):
+        base = 'recipient = "@x"\n[ai]\nenabled = true\n[[schedule]]\nname = "a"\nbetween = ["07:00", "09:00"]\nmessages = ["hi"]\n'
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            for text in ('api_key = "sk-ant-top"\n' + base, base + 'api_key = "sk-ant-top"\n'):
+                path.write_text(text)
+                self.assertEqual(load_config(path).ai.api_key, "sk-ant-top")
+
+    def test_api_key_mistakes_are_explained(self):
+        base = 'recipient = "@x"\n[[schedule]]\nname = "a"\nbetween = ["07:00", "09:00"]\nmessages = ["hi"]\n'
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text('api_hash = "sk-ant-api03-abc"\n' + base)
+            with self.assertRaisesRegex(ConfigError, "Move it to api_key"):
+                load_config(path)
+            path.write_text(base + '[ai]\n# api_key = "sk-ant-api03-' + "x" * 40 + '"\n')
+            self.assertIn("Delete the #", load_config(path).ai.key_hint)
+            path.write_text(base + '[ai]\n# api_key = "sk-ant-..."\n')  # the untouched example line
+            self.assertEqual(load_config(path).ai.key_hint, "")
+
     def test_bad_config(self):
         cases = {
             'recipient = "@x"\n[[schedule]]\nname = "a"\nbetween = ["7:3", "9:00"]\nmessages = ["hi"]': "couldn't read time",
