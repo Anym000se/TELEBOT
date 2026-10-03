@@ -17,6 +17,13 @@ With **calendar sync** on, plans you two make in the chat go on your Google Cale
 - If the plan moves ("can we do 8 instead?") it updates the event, and if it's called off it removes it
 - It sends you a note in Saved Messages whenever it changes something, and it only ever touches events it created
 
+With **auto-replies** on (they're off unless you turn them on), the bot covers for you when you're busy:
+
+- If she texts and you haven't answered in 30 minutes, it sends **one** short holding reply in your style, like "sorry got caught up, will text you properly soon"
+- It never answers her questions, agrees to plans, or says what you're doing, and it won't send another until you've replied yourself
+- If her message is serious (she's upset, something's wrong, or it needs a real answer), it doesn't reply and leaves you a note instead
+- It stays quiet overnight (11:30pm to 7:30am by default), and tells you in Saved Messages whenever it replies for you
+
 Without AI it picks from message lists you write. Either way it:
 
 - Sends at **random times** inside each window, so it isn't suspiciously 8:00:00 every morning
@@ -116,7 +123,8 @@ The Google sign-in needs a browser. If your server doesn't have one, do step 5 o
 | `python bot.py --plan` | Shows the planned send times for the next 3 days |
 | `python bot.py --now "goodnight"` | Sends her one text for that slot right now (and counts it as today's) |
 | `python bot.py --check-calendar` | Shows what it would put on your calendar from the last few days of chat. Changes nothing |
-| `--to me` | Sends to your Saved Messages instead, for testing. Doesn't count toward the real schedule, and calendar sync stays off |
+| `python bot.py --check-reply` | Shows what it would auto-reply if she'd been waiting right now. Sends nothing |
+| `--to me` | Sends to your Saved Messages instead, for testing. Doesn't count toward the real schedule, and calendar sync and auto-replies stay off |
 | `--config other.toml` | Uses a different config file |
 
 ## Good to know
@@ -124,6 +132,7 @@ The Google sign-in needs a browser. If your server doesn't have one, do step 5 o
 - `telebot.session` is your logged-in Telegram session, and `google-token.json` is your Google sign-in. **Anyone who has them can use your accounts.** Don't share or commit them (they're already in `.gitignore`).
 - **Privacy:** with `read_recent_chat = true`, your latest messages with her go to Anthropic's API each time a text is written: 10 by default (set by `read_last_messages`), and never more than 3 days back. Set `read_recent_chat = false` and Claude only sees `about_us` and the examples. Calendar sync always reads the same number of latest messages, plus the titles and times of your calendar events for the next 60 days, so it doesn't add duplicates.
 - **Cost:** with the default model, each text costs roughly 1–3 cents, so about $1–3 a month at three texts a day. Calendar checks cost about the same each. One runs when you two stop texting for a few minutes and the new messages mention a day, a time, or a plan; small talk is skipped for free. `claude-sonnet-5-5` costs about half as much.
+- To turn on auto-replies, set `enabled = true` under `[auto_reply]` in `config.toml` (copy that section from `config.example.toml` if yours doesn't have it), then try `python bot.py --check-reply` first. Auto-replies read the same latest messages as the AI texts, and each one costs about the same as a text.
 - Calendar sync waits until the chat has been quiet for 3 minutes, so a back-and-forth like "dinner friday?" / "yes! 7?" / "perfect" becomes one event.
 - If Claude can't be reached or your key is wrong, it logs the problem and sends a text from your list instead. A calendar check that fails gets retried after the next message.
 - Keep the volume reasonable. A few texts a day is fine, but Telegram flags accounts that look like they're spamming.

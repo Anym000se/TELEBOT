@@ -1,5 +1,6 @@
 import asyncio
 import importlib.util
+from unittest import mock
 import json
 import unittest
 from datetime import date, datetime, time, timedelta, timezone
@@ -10,8 +11,8 @@ from zoneinfo import ZoneInfo
 
 import gcal
 from bot import (
-    AIConfig, CalendarWatcher, ChatLine, ConfigError, Slot, State, compose, load_config, pick_message, plan_day,
-    recent_chat,
+    AIConfig, AutoReplier, AutoReplyConfig, CalendarWatcher, ChatLine, ConfigError, Slot, State, compose,
+    first_unanswered, in_quiet_hours, load_config, pick_message, plan_day, recent_chat,
 )
 
 HAS_ANTHROPIC = importlib.util.find_spec("anthropic") is not None
@@ -737,6 +738,175 @@ class CalendarWatcherTests(unittest.IsolatedAsyncioTestCase):
         await watcher._on_message(SimpleNamespace(message=SimpleNamespace(id=15)))  # the bot's own text
         await asyncio.sleep(0.2)
         self.assertEqual(len(self.finder.calls), 1)
+
+
+def line(message_id, who, minutes_ago, text="hi"):
+    return ChatLine(message_id, datetime.now(TZ) - timedelta(minutes=minutes_ago), who, text)
+
+
+class FirstUnansweredTests(unittest.TestCase):
+    def test_cases(self):
+        her_after_me = [line(1, "me", 60), line(2, "her", 40), line(3, "her", 35)]
+        self.assertEqual(first_unanswered(her_after_me, 0).id, 2)
+        self.assertIsNone(first_unanswered([line(1, "her", 40), line(2, "me", 10)], 0))  # you replied
+        self.assertIsNone(first_unanswered(her_after_me[:1] + [line(9, "me", 30), line(10, "her", 5)], 9))  # bot already replied
+        self.assertEqual(first_unanswered([line(1, "her", 50), line(2, "her", 40)], 0).id, 1)
+        self.assertIsNone(first_unanswered([], 0))
+
+    def test_quiet_hours(self):
+        overnight = (time(23, 30), time(7, 30))
+        self.assertTrue(in_quiet_hours(at(23, 45), overnight))
+        self.assertTrue(in_quiet_hours(at(3), overnight))
+        self.assertFalse(in_quiet_hours(at(12), overnight))
+        self.assertTrue(in_quiet_hours(at(13), (time(12), time(14))))
+        self.assertFalse(in_quiet_hours(at(3), None))
+
+
+class AutoReplyConfigTests(unittest.TestCase):
+    base = 'recipient = "@x"\n[[schedule]]\nname = "a"\nbetween = ["07:00", "09:00"]\nmessages = ["hi"]\n'
+
+    def load(self, extra):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text(self.base + extra)
+            return load_config(path)
+
+    def test_defaults_and_off(self):
+        self.assertIsNone(self.load("").auto_reply)
+        reply = self.load("[auto_reply]\nenabled = true\n").auto_reply
+        self.assertEqual((reply.after, reply.quiet_hours, reply.notify_me), (timedelta(minutes=30), (time(23, 30), time(7, 30)), True))
+        self.assertIsNone(self.load("[auto_reply]\nenabled = true\nquiet_hours = []\n").auto_reply.quiet_hours)
+
+    def test_bad_values(self):
+        for extra, error in (("after_minutes = 1", "5 to 720"), ('quiet_hours = ["23:30"]', "quiet_hours")):
+            with self.assertRaisesRegex(ConfigError, error):
+                self.load(f"[auto_reply]\nenabled = true\n{extra}\n")
+
+    def test_example_config_has_it_off(self):
+        self.assertIsNone(load_config(Path(__file__).with_name("config.example.toml")).auto_reply)
+
+
+class FakeReplier:
+    def __init__(self, draft):
+        self.draft = draft
+        self.calls = []
+
+    async def write(self, now, waited_minutes, chat):
+        self.calls.append((waited_minutes, chat))
+        return self.draft
+
+
+class AutoReplierTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.cfg = ai_config()
+        self.cfg.auto_reply = AutoReplyConfig(timedelta(minutes=30), None, True)
+        self.state = State(None)
+        self.sent = []
+
+    def chat(self, *messages):
+        # (id, out, minutes ago, text), oldest first
+        now = datetime.now(timezone.utc)
+        newest_first = [SimpleNamespace(id=i, out=out, date=now - timedelta(minutes=ago), message=text)
+                        for i, out, ago, text in reversed(messages)]
+        self.telegram = ChatWithNotes(newest_first)
+
+    def replier(self, draft):
+        self.fake = FakeReplier(draft)
+        self.auto = AutoReplier(self.cfg, self.telegram, "her", self.fake, self.state, set())
+        return self.auto
+
+    async def fake_send(self, client, entity, text):
+        self.sent.append((entity, text))
+        return SimpleNamespace(id=100 + len(self.sent))
+
+    async def check(self):
+        with mock.patch("bot.send", self.fake_send):
+            return await self.auto.check()
+
+    async def asyncTearDown(self):
+        if getattr(self, "auto", None) and self.auto._timer:
+            self.auto._timer.cancel()
+
+    async def test_replies_once_when_she_has_waited(self):
+        self.chat((1, True, 90, "see you later"), (2, False, 40, "hows work going"), (3, False, 35, "?"))
+        self.replier(SimpleNamespace(send=True, message="sorry busy, will text you properly soon", skip_reason=""))
+        with self.assertLogs("telebot", "INFO"):
+            self.assertEqual(await self.check(), "sorry busy, will text you properly soon")
+        self.assertEqual(self.sent, [("her", "sorry busy, will text you properly soon")])
+        self.assertEqual(self.fake.calls[0][0], 40)
+        self.assertEqual(self.state.auto_reply_id, 101)
+        self.assertIn("I replied for you", self.telegram.notes[0][1])
+
+        # The reply shows up in the chat, then she texts again: no second auto-reply.
+        self.telegram.messages[:0] = [SimpleNamespace(id=4, out=False, date=datetime.now(timezone.utc), message="ok!"),
+                                      SimpleNamespace(id=101, out=True, date=datetime.now(timezone.utc), message="sorry busy")]
+        self.assertIsNone(await self.check())
+        self.assertEqual(len(self.sent), 1)
+
+    async def test_waits_until_its_been_long_enough(self):
+        self.chat((1, False, 10, "hey"))
+        self.replier(SimpleNamespace(send=True, message="x", skip_reason=""))
+        self.assertIsNone(await self.check())
+        self.assertEqual(self.fake.calls, [])
+        self.assertIsNotNone(self.auto._timer)  # checks again when the 30 minutes are up
+
+    async def test_nothing_when_you_replied(self):
+        self.chat((1, False, 50, "hey"), (2, True, 45, "hey!"))
+        self.replier(SimpleNamespace(send=True, message="x", skip_reason=""))
+        self.assertIsNone(await self.check())
+        self.assertEqual(self.fake.calls, [])
+
+    async def test_too_old_and_quiet_hours(self):
+        self.chat((1, False, 180, "hey"))
+        self.replier(SimpleNamespace(send=True, message="x", skip_reason=""))
+        with self.assertLogs("telebot", "INFO"):
+            self.assertIsNone(await self.check())
+        now = datetime.now(TZ)
+        self.cfg.auto_reply.quiet_hours = ((now - timedelta(hours=1)).time(), (now + timedelta(hours=1)).time())
+        self.chat((1, False, 40, "hey"))
+        self.replier(SimpleNamespace(send=True, message="x", skip_reason=""))
+        with self.assertLogs("telebot", "INFO"):
+            self.assertIsNone(await self.check())
+        self.assertEqual((self.fake.calls, self.sent), ([], []))
+
+    async def test_serious_message_is_left_for_you(self):
+        self.chat((1, False, 40, "can we talk? im really upset"))
+        self.replier(SimpleNamespace(send=False, message="sorry, later?", skip_reason="she's upset and needs you"))
+        with self.assertLogs("telebot", "INFO"):
+            self.assertIsNone(await self.check())
+        self.assertEqual(self.sent, [])
+        self.assertIn("this needs you", self.telegram.notes[0][1])
+        self.assertIsNone(await self.check())  # Claude isn't asked again for the same stretch
+        self.assertEqual(len(self.fake.calls), 1)
+
+    async def test_claude_unreachable_sends_nothing(self):
+        self.chat((1, False, 40, "hey"))
+        self.replier(None)
+        self.assertIsNone(await self.check())
+        self.assertEqual((self.sent, self.telegram.notes, self.state.auto_reply_id), ([], [], 0))
+
+    async def test_reads_only_the_latest_messages(self):
+        self.cfg.ai.read_last_messages = 2
+        self.chat((1, True, 90, "a"), (2, False, 50, "b"), (3, False, 40, "c"))
+        self.replier(SimpleNamespace(send=True, message="x", skip_reason=""))
+        with self.assertLogs("telebot", "INFO"):
+            await self.check()
+        self.assertEqual([chat_line.text for chat_line in self.fake.calls[0][1]], ["b", "c"])
+
+
+@unittest.skipUnless(HAS_ANTHROPIC, "anthropic not installed")
+class ReplierTests(unittest.IsolatedAsyncioTestCase):
+    async def test_request(self):
+        from ai import Replier
+
+        mock_claude = MockClaude(body=MockClaude.reply({"send": True, "message": "sorry busy, text u soon", "skip_reason": ""}))
+        draft = await Replier(mock_claude.client, "claude-opus-5-5", "Her name is Sam.").write(
+            at(14, 10), 34, [ChatLine(5, at(13, 36), "her", "hows work")])
+        self.assertEqual(draft.message, "sorry busy, text u soon")
+        sent = json.loads(mock_claude.requests[0].content)
+        self.assertIn("holding reply", json.dumps(sent["system"]))
+        self.assertIn("waiting about 34 minutes", sent["messages"][0]["content"])
+        self.assertIn("her: hows work", sent["messages"][0]["content"])
 
 
 if __name__ == "__main__":

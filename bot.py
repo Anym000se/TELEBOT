@@ -7,6 +7,7 @@ Setup is in README.md. Quick reference:
     python bot.py --now "good morning"    # send one text from that slot right now
     python bot.py --now "good morning" --to me   # same, but to your Saved Messages
     python bot.py --check-calendar        # show what it would put on your calendar (changes nothing)
+    python bot.py --check-reply           # show what it would auto-reply to her right now (sends nothing)
 
 With [ai] turned on in config.toml, Claude writes each text (see ai.py). With [calendar]
 turned on, plans you make in the chat go on your Google Calendar (see gcal.py).
@@ -70,6 +71,13 @@ class CalendarConfig:
 
 
 @dataclass
+class AutoReplyConfig:
+    after: timedelta
+    quiet_hours: tuple[time, time] | None
+    notify_me: bool
+
+
+@dataclass
 class Config:
     api_id: int | str | None
     api_hash: str | None
@@ -81,6 +89,7 @@ class Config:
     state_path: Path
     ai: AIConfig
     calendar: CalendarConfig | None = None
+    auto_reply: AutoReplyConfig | None = None
 
     def slot(self, name: str) -> Slot:
         for slot in self.slots:
@@ -186,6 +195,21 @@ def load_config(path: Path) -> Config:
             token_path=path.parent / "google-token.json",
         )
 
+    auto_reply = None
+    reply_raw = raw.get("auto_reply", {})
+    if reply_raw.get("enabled", False):
+        after = reply_raw.get("after_minutes", 30)
+        if isinstance(after, bool) or not isinstance(after, int) or not 5 <= after <= 720:
+            raise ConfigError("after_minutes under [auto_reply] should be a number from 5 to 720 (no quotes).")
+        quiet = reply_raw.get("quiet_hours", ["23:30", "07:30"])
+        if quiet == []:
+            quiet_hours = None
+        elif isinstance(quiet, list) and len(quiet) == 2:
+            quiet_hours = tuple(_parse_time(t, "auto_reply") for t in quiet)
+        else:
+            raise ConfigError('quiet_hours under [auto_reply] should look like ["23:30", "07:30"], or [] for none.')
+        auto_reply = AutoReplyConfig(timedelta(minutes=after), quiet_hours, bool(reply_raw.get("notify_me", True)))
+
     skip_minutes = float(raw.get("skip_if_i_texted_within_minutes", 0))
     return Config(
         api_id=raw.get("api_id"),
@@ -198,6 +222,7 @@ def load_config(path: Path) -> Config:
         state_path=path.parent / "state.json",
         ai=ai,
         calendar=calendar,
+        auto_reply=auto_reply,
     )
 
 
@@ -237,6 +262,26 @@ class State:
     @calendar_seen.setter
     def calendar_seen(self, message_id: int):
         self.data["calendar_seen"] = message_id
+        self.save()
+
+    @property
+    def auto_reply_id(self) -> int:
+        """The bot's last holding reply, so it never sends a second one before you've replied yourself."""
+        return self.data.get("auto_reply_id", 0)
+
+    @auto_reply_id.setter
+    def auto_reply_id(self, message_id: int):
+        self.data["auto_reply_id"] = message_id
+        self.save()
+
+    @property
+    def auto_reply_skipped(self) -> int:
+        """Her first message of the last stretch Claude said needs you, so it isn't asked again."""
+        return self.data.get("auto_reply_skipped", 0)
+
+    @auto_reply_skipped.setter
+    def auto_reply_skipped(self, message_id: int):
+        self.data["auto_reply_skipped"] = message_id
         self.save()
 
     def save(self):
@@ -316,9 +361,9 @@ async def resolve(client, cfg: Config, recipient: str, needs_her: bool):
 
 
 def make_ai(cfg: Config):
-    """Claude, as (text writer, plan finder). Each is None if the feature using it is off."""
-    if not cfg.ai.write_texts and cfg.calendar is None:
-        return None, None
+    """Claude, as (text writer, plan finder, auto-replier). Each is None if the feature using it is off."""
+    if not cfg.ai.write_texts and cfg.calendar is None and cfg.auto_reply is None:
+        return None, None, None
     try:
         import ai
     except ImportError:
@@ -331,14 +376,15 @@ def make_ai(cfg: Config):
     client = ai.new_client(cfg.ai.api_key)
     if not ai.has_credentials(client):
         raise ConfigError(
-            "There's no Anthropic API key (AI texts and the calendar both need one). Put it under "
+            "There's no Anthropic API key (AI texts, the calendar and auto-replies need one). Put it under "
             '[ai] in config.toml as: api_key = "sk-ant-..."' + cfg.ai.key_hint
         )
     if "___" in cfg.ai.about_us:
         log.warning("Tip: fill in about_us under [ai] in config.toml so Claude knows who's who")
     writer = ai.Writer(client, cfg.ai.model, cfg.ai.about_us) if cfg.ai.write_texts else None
     finder = ai.PlanFinder(client, cfg.ai.model, cfg.ai.about_us) if cfg.calendar else None
-    return writer, finder
+    replier = ai.Replier(client, cfg.ai.model, cfg.ai.about_us) if cfg.auto_reply else None
+    return writer, finder, replier
 
 
 def _is_google_file(path: Path) -> bool:
@@ -498,10 +544,11 @@ class CalendarWatcher:
     # "perfect" becomes one event instead of three guesses.
     quiet_seconds = 180
 
-    def __init__(self, cfg: Config, client, her, finder, calendar: gcal.GoogleCalendar, state: State):
+    def __init__(self, cfg: Config, client, her, finder, calendar: gcal.GoogleCalendar, state: State,
+                 ignore: set[int] | None = None):
         self.cfg, self.client, self.her = cfg, client, her
         self.finder, self.calendar, self.state = finder, calendar, state
-        self.ignore: set[int] = set()  # ids of the bot's own texts, which never contain plans
+        self.ignore = ignore if ignore is not None else set()  # ids of the bot's own texts, which never contain plans
         self._timer = None
         self._told_signed_out = False
         self._waiting = False  # a check is scheduled for when the chat goes quiet
@@ -620,20 +667,148 @@ class CalendarWatcher:
         return f"📅 Updated on your calendar: {gcal.describe(body)}{quote}"
 
 
-async def run_forever(cfg: Config, state: State, writer, finder, calendar, recipient: str, skip_within: timedelta | None):
+def first_unanswered(chat: list[ChatLine], auto_reply_id: int) -> ChatLine | None:
+    """Her first message since you last wrote, or None if there's nothing waiting on you.
+
+    The bot's own holding reply doesn't count as you writing back, but it does mean this
+    stretch has had its one reply already.
+    """
+    first = None
+    for line in reversed(chat):
+        if line.who == "me":
+            return None if line.id == auto_reply_id else first
+        first = line
+    return first
+
+
+def in_quiet_hours(now: datetime, quiet: tuple[time, time] | None) -> bool:
+    if quiet is None:
+        return False
+    start, end, t = quiet[0], quiet[1], now.time()
+    return start <= t < end if start < end else (t >= start or t < end)
+
+
+class AutoReplier:
+    """If she texts and you don't answer for a while, sends one short holding reply for you.
+
+    Never more than one before you write back yourself, never during quiet hours, and
+    nothing at all if Claude thinks her message needs you personally.
+    """
+
+    # Past this, a "be right back" text would just be odd.
+    max_age = timedelta(hours=2)
+
+    def __init__(self, cfg: Config, client, her, replier, state: State, bot_sent: set[int]):
+        self.cfg, self.client, self.her = cfg, client, her
+        self.replier, self.state, self.bot_sent = replier, state, bot_sent
+        self._timer = None
+        self._lock = asyncio.Lock()
+        self._tasks: set[asyncio.Task] = set()
+
+    def start(self):
+        from telethon import events
+
+        self.client.add_event_handler(self._on_message, events.NewMessage(chats=self.her, incoming=True))
+        self._schedule(0)  # she may have texted while the bot was off
+
+    async def _on_message(self, event):
+        if self._timer is None:  # the clock runs from her first unanswered message, not her latest
+            self._schedule(self.cfg.auto_reply.after.total_seconds())
+
+    def _schedule(self, delay: float):
+        if self._timer:
+            self._timer.cancel()
+        self._timer = asyncio.get_running_loop().call_later(delay, self._fire)
+
+    def _fire(self):
+        self._timer = None
+        task = asyncio.create_task(self._check_safely())
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _check_safely(self):
+        try:
+            await self.check()
+        except Exception:
+            log.exception("Auto-reply check failed")
+
+    async def check(self) -> str | None:
+        """Reply for you if she's been waiting long enough. Returns what was sent, if anything."""
+        async with self._lock:
+            chat = await recent_chat(self.client, self.her, self.cfg.tz, 30)
+            first = first_unanswered(chat, self.state.auto_reply_id)
+            if first is None or first.id == self.state.auto_reply_skipped:
+                return None
+            now = datetime.now(self.cfg.tz)
+            waited = now - first.when
+            if waited < self.cfg.auto_reply.after:
+                if self._timer is None:
+                    self._schedule((self.cfg.auto_reply.after - waited).total_seconds())
+                return None
+            if waited > self.max_age:
+                log.info("Auto-reply: her message is over %d hours old, so it's left for you", self.max_age.seconds // 3600)
+                return None
+            if in_quiet_hours(now, self.cfg.auto_reply.quiet_hours):
+                log.info("Auto-reply: she's waiting, but it's quiet hours, so it's left for you")
+                return None
+
+            minutes = int(waited.total_seconds() // 60)
+            draft = await self.replier.write(now, minutes, chat[-self.cfg.ai.read_last_messages:])
+            if draft is None:
+                return None  # Claude couldn't be reached; it tries again when she next texts
+            if not draft.send:
+                self.state.auto_reply_skipped = first.id
+                log.info("Auto-reply: not replying for you, this needs you: %s", draft.skip_reason)
+                if self.cfg.auto_reply.notify_me:
+                    await self.client.send_message(
+                        "me", f"⚠️ She's been waiting {minutes} min and this needs you, so I didn't reply for you: "
+                              f"{draft.skip_reason}")
+                return None
+
+            sent = await send(self.client, self.her, draft.message)
+            if sent is not None:
+                self.bot_sent.add(sent.id)
+                self.state.auto_reply_id = sent.id
+            log.info("Auto-replied after %d min: %s", minutes, draft.message)
+            if self.cfg.auto_reply.notify_me:
+                await self.client.send_message("me", f'🤖 She\'d been waiting {minutes} min, so I replied for you: "{draft.message}"')
+            return draft.message
+
+    async def preview(self) -> str:
+        """What it would do if she'd been waiting right now. Sends nothing."""
+        chat = await recent_chat(self.client, self.her, self.cfg.tz, 30)
+        minutes = int(self.cfg.auto_reply.after.total_seconds() // 60)
+        draft = await self.replier.write(datetime.now(self.cfg.tz), minutes, chat[-self.cfg.ai.read_last_messages:])
+        if draft is None:
+            return "(Claude couldn't be reached)"
+        if draft.send:
+            return f'It would reply: "{draft.message}"'
+        return f'It would NOT reply, and would tell you instead: {draft.skip_reason}\n(Its draft was: "{draft.message}")'
+
+
+def _and(names: list[str]) -> str:
+    return names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
+
+
+async def run_forever(cfg: Config, state: State, writer, finder, replier, calendar, recipient: str,
+                      skip_within: timedelta | None):
     client = await connect(cfg)
     try:
         watching = calendar is not None and finder is not None
-        needs_her = (writer is not None and cfg.ai.read_recent_chat) or watching
+        needs_her = (writer is not None and cfg.ai.read_recent_chat) or watching or replier is not None
         to, her = await resolve(client, cfg, recipient, needs_her)
-        watcher = None
+        bot_sent: set[int] = set()  # the bot's own texts, so nothing mistakes them for you
+        watcher = auto = None
         if watching:
-            watcher = CalendarWatcher(cfg, client, her, finder, calendar, state)
+            watcher = CalendarWatcher(cfg, client, her, finder, calendar, state, ignore=bot_sent)
             watcher.start()
-        extras = [name for name, on in (("AI texts", writer), ("calendar sync", watcher)) if on]
+        if replier is not None:
+            auto = AutoReplier(cfg, client, her, replier, state, bot_sent)
+            auto.start()
+        extras = [name for name, on in (("AI texts", writer), ("calendar sync", watcher), ("auto-replies", auto)) if on]
         log.info(
             "Logged in. Texting %s on schedule%s (Ctrl+C to stop).",
-            recipient, f" with {' and '.join(extras)}" if extras else "",
+            recipient, f" with {_and(extras)}" if extras else "",
         )
         # Start from yesterday in case a window that runs past midnight is still open.
         day = datetime.now(cfg.tz).date() - timedelta(days=1)
@@ -655,8 +830,8 @@ async def run_forever(cfg: Config, state: State, writer, finder, calendar, recip
                         state.record(slot.name, day)
                         continue
                     sent = await send(client, to, text)
-                    if watcher and sent is not None:
-                        watcher.ignore.add(sent.id)
+                    if sent is not None:
+                        bot_sent.add(sent.id)
                 except Exception:
                     log.exception('Failed to send "%s"', slot.name)
                     continue
@@ -695,6 +870,18 @@ async def check_calendar(cfg: Config, finder, calendar: gcal.GoogleCalendar, cha
         await client.disconnect()
 
 
+async def check_reply(cfg: Config, replier):
+    client = await connect(cfg)
+    try:
+        her = await find(client, cfg.recipient)
+        auto = AutoReplier(cfg, client, her, replier, State(None), set())
+        print(f"\nIf she'd been waiting {int(cfg.auto_reply.after.total_seconds() // 60)} minutes for a reply right now:\n")
+        print(await auto.preview())
+        print("\nThis was a preview. Nothing was sent.")
+    finally:
+        await client.disconnect()
+
+
 def print_plan(cfg: Config, state: State, days: int = 3):
     now = datetime.now(cfg.tz)
     for offset in range(days):
@@ -715,6 +902,8 @@ def main():
     mode.add_argument("--now", metavar="SLOT", help="send one text for this schedule slot right now")
     mode.add_argument("--check-calendar", action="store_true",
                       help="show what it would put on your calendar from the last few days of chat (changes nothing)")
+    mode.add_argument("--check-reply", action="store_true",
+                      help="show what it would auto-reply to her if she'd been waiting right now (sends nothing)")
     parser.add_argument("--to", metavar="WHO", help='send to someone else instead, e.g. "me" for your Saved Messages')
     args = parser.parse_args()
 
@@ -730,22 +919,28 @@ def main():
             print_plan(cfg, state)
         elif args.now:
             slot = cfg.slot(args.now)
-            writer, _ = make_ai(cfg)
+            writer, _, _ = make_ai(cfg)
             asyncio.run(send_now(cfg, state, writer, recipient, slot))
         elif args.check_calendar:
             if cfg.calendar is None:
                 raise ConfigError("Calendar sync is off. Set enabled = true under [calendar] in config.toml.")
-            _, finder = make_ai(cfg)
+            _, finder, _ = make_ai(cfg)
             asyncio.run(check_calendar(cfg, finder, open_calendar(cfg), args.to or cfg.recipient))
+        elif args.check_reply:
+            if cfg.auto_reply is None:
+                raise ConfigError("Auto-replies are off. Set enabled = true under [auto_reply] in config.toml.")
+            _, _, replier = make_ai(cfg)
+            asyncio.run(check_reply(cfg, replier))
         else:
-            writer, finder = make_ai(cfg)
+            writer, finder, replier = make_ai(cfg)
             calendar = None
-            if args.to and cfg.calendar:
-                log.info("Calendar sync is off during test runs with --to")
+            if args.to and (cfg.calendar or cfg.auto_reply):
+                log.info("Calendar sync and auto-replies are off during test runs with --to")
+                replier = None
             elif cfg.calendar:
                 calendar = open_calendar(cfg)
             skip_within = None if args.to else cfg.skip_if_texted_within
-            asyncio.run(run_forever(cfg, state, writer, finder, calendar, recipient, skip_within))
+            asyncio.run(run_forever(cfg, state, writer, finder, replier, calendar, recipient, skip_within))
     except ConfigError as e:
         sys.exit(f"Error: {e}")
     except KeyboardInterrupt:

@@ -32,6 +32,28 @@ this text would come across as ignoring it. Otherwise set `send` to true and lea
 About us:
 {about_us}"""
 
+REPLY_PROMPT = """\
+You write a quick holding reply that gets sent from my Telegram account to my girlfriend \
+when she has texted and I haven't been able to answer for a while. She'll read it as coming \
+from me, so it has to sound like me typing on my phone.
+
+The only goal is to let her know I'm not ignoring her and will reply properly soon:
+- One short text, in my style. My real messages in the chat show how I text: length, \
+capitalization, punctuation, emoji, slang.
+- Keep it true and vague. Don't answer her questions, agree to plans, make promises, give \
+opinions, or say what I'm doing or where I am. I'll handle all of that myself when I'm back.
+- A light reaction is fine if it fits (like "haha" to something funny), as long as it's \
+still a holding reply.
+
+Set `send` to false and say why in `skip_reason` when a holding reply would be the wrong \
+move: she's upset, worried or hurt; something might be wrong or urgent; she's asked \
+something important or personal that needs a real answer from me; or a vague reply would \
+come across as cold or dismissive. Otherwise set `send` to true and leave `skip_reason` \
+empty. Either way, write the best text you can in `message`.
+
+About us:
+{about_us}"""
+
 PLANS_PROMPT = """\
 You keep my Google Calendar in sync with plans from my Telegram chat with my girlfriend. \
 Read the new messages (below the "new messages" line; anything above it is only context, \
@@ -158,6 +180,16 @@ def _format_chat(chat, first_new_id: int | None = None) -> list[str]:
     return lines
 
 
+def _tidy(draft: Draft | None) -> Draft | None:
+    """Strip stray quotes; a draft that should be sent but is empty counts as no draft."""
+    if draft is None:
+        return None
+    draft.message = draft.message.strip().strip('"').strip()
+    if draft.send and not draft.message:
+        return None
+    return draft
+
+
 class Writer:
     def __init__(self, client, model: str, about_us: str):
         self.client = client
@@ -167,13 +199,7 @@ class Writer:
     async def write(self, slot_name: str, examples: list[str], now: datetime, chat, recent: list[str]) -> Draft | None:
         """Ask Claude for a text. Returns None if it couldn't, so the caller can fall back to the list."""
         prompt = self._prompt(slot_name, examples, now, chat, recent)
-        draft = await ask(self.client, self.model, self.system, prompt, Draft, "using the message list instead")
-        if draft is None:
-            return None
-        draft.message = draft.message.strip().strip('"').strip()
-        if draft.send and not draft.message:
-            return None
-        return draft
+        return _tidy(await ask(self.client, self.model, self.system, prompt, Draft, "using the message list instead"))
 
     @staticmethod
     def _prompt(slot_name, examples, now, chat, recent) -> str:
@@ -220,3 +246,21 @@ class PlanFinder:
             lines.append("(nothing)")
         lines += ["", "Our chat, oldest first:", *_format_chat(chat, first_new_id)]
         return "\n".join(lines)
+
+
+class Replier:
+    def __init__(self, client, model: str, about_us: str):
+        self.client = client
+        self.model = model
+        self.system = REPLY_PROMPT.format(about_us=about_us or "(nothing provided)")
+
+    async def write(self, now: datetime, waited_minutes: int, chat) -> Draft | None:
+        """A holding reply to her unanswered messages. None if Claude couldn't be asked."""
+        prompt = "\n".join([
+            f"It's {now:%A, %B} {now.day}, {_clock(now)}. She's been waiting about {waited_minutes} "
+            "minutes for me to reply.",
+            "",
+            "Our recent chat, oldest first:",
+            *_format_chat(chat),
+        ])
+        return _tidy(await ask(self.client, self.model, self.system, prompt, Draft, "so not replying for you"))

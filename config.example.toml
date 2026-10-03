@@ -61,6 +61,23 @@ calendar_id = "primary"
 # Send yourself a note in Saved Messages whenever it adds, moves, or removes something.
 notify_me = true
 
+[auto_reply]
+# If she texts and you haven't replied after a while, send ONE short holding reply in your
+# style ("sorry got caught up, will text you properly soon"). It never answers questions,
+# agrees to plans, or says what you're doing, and it won't send another until you've
+# replied yourself. If her message seems serious, it doesn't reply and tells you instead.
+# Uses the Anthropic key from [ai] and reads the same number of latest messages.
+enabled = false
+
+# How long she waits, from her first unanswered message, before it replies.
+after_minutes = 30
+
+# Don't auto-reply between these times (you'd be asleep). Use [] to allow any time.
+quiet_hours = ["23:30", "07:30"]
+
+# Send yourself a note in Saved Messages whenever it replies for you, or decides not to.
+notify_me = true
+
 # Each [[schedule]] is one text per day, sent at a random time inside `between`
 # (so it's not suspiciously 8:00:00 every morning). A window can run past midnight,
 # e.g. ["23:30", "00:30"]. Add, remove, or rename slots however you like.
