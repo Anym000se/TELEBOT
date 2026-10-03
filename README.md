@@ -24,6 +24,12 @@ With **auto-replies** on (they're off unless you turn them on), the bot covers f
 - If her message is serious (she's upset, something's wrong, or it needs a real answer), it doesn't reply and leaves you a note instead
 - It stays quiet overnight (11:30pm to 7:30am by default), and tells you in Saved Messages whenever it replies for you
 
+It also looks after you, with private notes in your Saved Messages that buzz your phone:
+
+- **Plan reminders:** a heads-up before plans on your calendar ("⏰ Aquarium with Raya at 2:00pm, in 1 hour")
+- **Morning brief:** each morning, today's plans, important dates coming up, things she mentioned that you could ask about ("how her shift went"), and once a week a few date ideas
+- **Important dates:** monthly or yearly ones like your anniversary or her birthday, with a heads-up a few days before and again on the day
+
 Without AI it picks from message lists you write. Either way it:
 
 - Sends at **random times** inside each window, so it isn't suspiciously 8:00:00 every morning
@@ -123,6 +129,7 @@ The Google sign-in needs a browser. If your server doesn't have one, do step 5 o
 | `python bot.py --plan` | Shows the planned send times for the next 3 days |
 | `python bot.py --now "goodnight"` | Sends her one text for that slot right now (and counts it as today's) |
 | `python bot.py --check-calendar` | Shows what it would put on your calendar from the last few days of chat. Changes nothing |
+| `python bot.py --brief` | Shows this morning's brief. Add `--to me` to get it in Saved Messages, to check it buzzes |
 | `python bot.py --check-reply` | Shows what it would auto-reply if she'd been waiting right now. Sends nothing |
 | `--to me` | Sends to your Saved Messages instead, for testing. Doesn't count toward the real schedule, and calendar sync and auto-replies stay off |
 | `--config other.toml` | Uses a different config file |
@@ -132,6 +139,8 @@ The Google sign-in needs a browser. If your server doesn't have one, do step 5 o
 - `telebot.session` is your logged-in Telegram session, and `google-token.json` is your Google sign-in. **Anyone who has them can use your accounts.** Don't share or commit them (they're already in `.gitignore`).
 - **Privacy:** with `read_recent_chat = true`, your latest messages with her go to Anthropic's API each time a text is written: 10 by default (set by `read_last_messages`), and never more than 3 days back. Set `read_recent_chat = false` and Claude only sees `about_us` and the examples. Calendar sync always reads the same number of latest messages, plus the titles and times of your calendar events for the next 60 days, so it doesn't add duplicates.
 - **Cost:** with the default model, each text costs roughly 1–3 cents, so about $1–3 a month at three texts a day. Calendar checks cost about the same each. One runs when you two stop texting for a few minutes and the new messages mention a day, a time, or a plan; small talk is skipped for free. `claude-sonnet-5-5` costs about half as much.
+- Reminders, the morning brief, and "she needs you" alerts go out as scheduled messages to your Saved Messages, a few seconds ahead. That's because Telegram only notifies you about your own messages when they're scheduled (its reminder feature). Other notes, like "📅 added" or "🤖 replied for you", arrive silently.
+- To add important dates, copy the `[[dates]]` example from `config.example.toml` into `config.toml`, delete the `#`s, and fill in your own. `every = "month"` counts monthly anniversaries (3 months, 4 months, ... then 1 year).
 - To turn on auto-replies, set `enabled = true` under `[auto_reply]` in `config.toml` (copy that section from `config.example.toml` if yours doesn't have it), then try `python bot.py --check-reply` first. Auto-replies read the same latest messages as the AI texts, and each one costs about the same as a text.
 - Calendar sync waits until the chat has been quiet for 3 minutes, so a back-and-forth like "dinner friday?" / "yes! 7?" / "perfect" becomes one event.
 - If Claude can't be reached or your key is wrong, it logs the problem and sends a text from your list instead. A calendar check that fails gets retried after the next message.

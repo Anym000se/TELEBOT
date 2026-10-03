@@ -78,6 +78,39 @@ quiet_hours = ["23:30", "07:30"]
 # Send yourself a note in Saved Messages whenever it replies for you, or decides not to.
 notify_me = true
 
+[reminders]
+# A buzz on your phone before plans on your calendar. Needs [calendar] on.
+enabled = true
+minutes_before = 60
+# true: only plans the bot added from your chat. false: everything on your calendar.
+only_plans_from_chat = true
+
+[morning_brief]
+# Every morning, a private note in Saved Messages that buzzes your phone: today's plans,
+# important dates coming up (see [[dates]] below), things she mentioned that you could
+# ask about, and once a week some date ideas. Uses the Anthropic key from [ai].
+enabled = true
+at = "08:00"
+# Which day you get date ideas. Use "" for never.
+date_ideas_on = "thursday"
+
+# Important dates show up in the morning brief: a heads-up a few days before, then on
+# the day. Copy the block for each one, and delete the # at the start of each line.
+# `every = "month"` counts monthly anniversaries (3 months, 4 months, ... then 1 year).
+# `every = "year"` is for birthdays and yearly anniversaries.
+#
+# [[dates]]
+# name = "our anniversary"
+# date = "2026-08-02"
+# every = "month"
+# heads_up_days = 3
+#
+# [[dates]]
+# name = "her birthday"
+# date = "2006-03-14"
+# every = "year"
+# heads_up_days = 7
+
 # Each [[schedule]] is one text per day, sent at a random time inside `between`
 # (so it's not suspiciously 8:00:00 every morning). A window can run past midnight,
 # e.g. ["23:30", "00:30"]. Add, remove, or rename slots however you like.

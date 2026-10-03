@@ -11,8 +11,9 @@ from zoneinfo import ZoneInfo
 
 import gcal
 from bot import (
-    AIConfig, AutoReplier, AutoReplyConfig, CalendarWatcher, ChatLine, ConfigError, Slot, State, compose,
-    first_unanswered, in_quiet_hours, load_config, pick_message, plan_day, recent_chat,
+    AIConfig, AutoReplier, AutoReplyConfig, BriefConfig, CalendarWatcher, ChatLine, ConfigError, ImportantDate,
+    MorningBrief, Reminders, RemindersConfig, Slot, State, compose, dates_coming_up, describe_date,
+    first_unanswered, in_quiet_hours, load_config, next_occurrence, pick_message, ping, plan_day, recent_chat,
 )
 
 HAS_ANTHROPIC = importlib.util.find_spec("anthropic") is not None
@@ -562,7 +563,7 @@ class FakeCalendar:
         self.events = list(upcoming)
         self.added, self.updated, self.cancelled = [], [], []
 
-    def upcoming(self):
+    def upcoming(self, days=60):
         return self.events
 
     def add(self, body):
@@ -591,7 +592,7 @@ class ChatWithNotes(FakeTelegram):
         super().__init__(messages)
         self.notes = []
 
-    async def send_message(self, to, text):
+    async def send_message(self, to, text, schedule=None):
         self.notes.append((to, text))
 
 
@@ -907,6 +908,221 @@ class ReplierTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("holding reply", json.dumps(sent["system"]))
         self.assertIn("waiting about 34 minutes", sent["messages"][0]["content"])
         self.assertIn("her: hows work", sent["messages"][0]["content"])
+
+
+class ImportantDateTests(unittest.TestCase):
+    def test_monthly(self):
+        together = ImportantDate("our anniversary", date(2026, 8, 2), "month", 3)
+        self.assertEqual(next_occurrence(together, date(2026, 10, 1)), (date(2026, 10, 2), 2))
+        self.assertEqual(next_occurrence(together, date(2026, 10, 2)), (date(2026, 10, 2), 2))  # today counts
+        self.assertEqual(next_occurrence(together, date(2026, 10, 3)), (date(2026, 11, 2), 3))
+        self.assertEqual(next_occurrence(together, date(2026, 12, 20)), (date(2027, 1, 2), 5))
+
+    def test_short_months_and_leap_days(self):
+        end_of_month = ImportantDate("x", date(2026, 1, 31), "month", 3)
+        self.assertEqual(next_occurrence(end_of_month, date(2026, 2, 10)), (date(2026, 2, 28), 1))
+        leap = ImportantDate("x", date(2024, 2, 29), "year", 3)
+        self.assertEqual(next_occurrence(leap, date(2026, 1, 1)), (date(2026, 2, 28), 2))
+
+    def test_yearly_and_future(self):
+        birthday = ImportantDate("her birthday", date(2006, 3, 14), "year", 7)
+        self.assertEqual(next_occurrence(birthday, date(2026, 10, 3)), (date(2027, 3, 14), 21))
+        later = ImportantDate("trip", date(2026, 12, 1), "year", 7)
+        self.assertEqual(next_occurrence(later, date(2026, 10, 3)), (date(2026, 12, 1), 0))
+
+    def test_describe(self):
+        together = ImportantDate("our anniversary", date(2026, 8, 2), "month", 3)
+        self.assertEqual(describe_date(together, 3), "our anniversary (3 months)")
+        self.assertEqual(describe_date(together, 1), "our anniversary (1 month)")
+        self.assertEqual(describe_date(together, 12), "our anniversary (1 year)")
+        self.assertEqual(describe_date(ImportantDate("her birthday", date(2006, 3, 14), "year", 7), 21), "her birthday (turns 21)")
+        self.assertEqual(describe_date(together, 0), "our anniversary")
+
+    def test_coming_up(self):
+        together = ImportantDate("our anniversary", date(2026, 8, 2), "month", 3)
+        self.assertEqual(dates_coming_up([together], date(2026, 10, 2)), ["🎉 Today: our anniversary (2 months)!"])
+        self.assertEqual(dates_coming_up([together], date(2026, 11, 1)),
+                         ["🎉 our anniversary (3 months) is tomorrow. Maybe plan something?"])
+        self.assertIn("in 3 days (Mon Nov 2)", dates_coming_up([together], date(2026, 10, 30))[0])
+        self.assertEqual(dates_coming_up([together], date(2026, 10, 20)), [])
+
+
+class ExtrasConfigTests(unittest.TestCase):
+    base = 'recipient = "@x"\n[[schedule]]\nname = "a"\nbetween = ["07:00", "09:00"]\nmessages = ["hi"]\n'
+
+    def load(self, extra):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text(self.base + extra)
+            return load_config(path)
+
+    def test_example_config(self):
+        cfg = load_config(Path(__file__).with_name("config.example.toml"))
+        self.assertEqual(cfg.reminders, RemindersConfig(timedelta(minutes=60), True))
+        self.assertEqual(cfg.brief, BriefConfig(time(8), 3))
+        self.assertEqual(cfg.dates, [])
+
+    def test_dates(self):
+        cfg = self.load('[[dates]]\nname = "our anniversary"\ndate = "2026-08-02"\nevery = "month"\n')
+        self.assertEqual(cfg.dates, [ImportantDate("our anniversary", date(2026, 8, 2), "month", 3)])
+
+    def test_mistakes(self):
+        cases = {
+            "[reminders]\nenabled = true\n": "need calendar sync",
+            '[morning_brief]\nenabled = true\ndate_ideas_on = "thurs"\n': "date_ideas_on",
+            '[[dates]]\nname = "x"\ndate = "02/08/2026"\n': "should look like",
+            '[[dates]]\nname = "x"\ndate = "2026-08-02"\nevery = "week"\n': '"month" or "year"',
+        }
+        for extra, error in cases.items():
+            with self.assertRaisesRegex(ConfigError, error):
+                self.load(extra)
+        self.assertIsNone(self.load('[morning_brief]\nenabled = true\ndate_ideas_on = ""\n').brief.date_ideas_on)
+
+
+class PingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_schedules_so_the_phone_buzzes(self):
+        calls = []
+
+        class Client:
+            async def send_message(self, to, text, schedule=None):
+                calls.append((to, text, schedule))
+
+        later = datetime.now(TZ) + timedelta(hours=1)
+        await ping(Client(), "hi", at=later)
+        await ping(Client(), "now")
+        self.assertEqual(calls[0], ("me", "hi", later))
+        self.assertGreater(calls[1][2], datetime.now(timezone.utc))  # still scheduled, just a few seconds out
+
+    async def test_falls_back_to_a_normal_note(self):
+        calls = []
+
+        class Client:
+            async def send_message(self, to, text, schedule=None):
+                if schedule is not None:
+                    raise RuntimeError("SCHEDULE_DATE_INVALID")
+                calls.append(text)
+
+        with self.assertLogs("telebot", "WARNING"):
+            await ping(Client(), "hi")
+        self.assertEqual(calls, ["hi"])
+
+
+def in_minutes(minutes):
+    return (datetime.now(TZ) + timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M")
+
+
+class RemindersTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.cfg = ai_config()
+        self.cfg.reminders = RemindersConfig(timedelta(minutes=60), True)
+        self.pings = []
+
+    async def fake_ping(self, client, text, at=None):
+        self.pings.append((text, at))
+
+    async def check(self, events, state):
+        with mock.patch("bot.ping", self.fake_ping):
+            return await Reminders(self.cfg, None, FakeCalendar(events), state).check()
+
+    async def test_reminds_once_before_plans(self):
+        state = State(None)
+        events = [
+            gcal.Event("a", "Aquarium with Raya", in_minutes(65), "", ours=True),  # reminder due in 5 min
+            gcal.Event("b", "Dinner", in_minutes(300), "", ours=True),  # too far off, next check gets it
+            gcal.Event("c", "Work meeting", in_minutes(65), "", ours=False),  # not a plan from the chat
+            gcal.Event("d", "Her exam", tomorrow(), "", ours=True),  # all day: that's the brief's job
+            gcal.Event("e", "Coffee", in_minutes(20), "", ours=True),  # added late: remind right away
+        ]
+        with self.assertLogs("telebot", "INFO"):
+            await self.check(events, state)
+        texts = [text for text, _ in self.pings]
+        self.assertEqual(len(texts), 2)
+        self.assertTrue(texts[0].startswith("⏰ Aquarium with Raya at ") and texts[0].endswith("in 1 hour"))
+        self.assertRegex(texts[1], r"Coffee at .*, in (19|20) min$")
+
+        self.pings.clear()
+        await self.check(events, state)
+        self.assertEqual(self.pings, [])  # no repeats
+
+        events[0] = gcal.Event("a", "Aquarium with Raya", in_minutes(70), "", ours=True)  # moved
+        with self.assertLogs("telebot", "INFO"):
+            await self.check(events, state)
+        self.assertEqual(len(self.pings), 1)
+
+    async def test_everything_on_the_calendar(self):
+        self.cfg.reminders.only_plans_from_chat = False
+        with self.assertLogs("telebot", "INFO"):
+            await self.check([gcal.Event("c", "Work meeting", in_minutes(65), "", ours=False)], State(None))
+        self.assertEqual(len(self.pings), 1)
+
+
+class FakeBriefer:
+    def __init__(self, notes):
+        self.notes = notes
+        self.calls = []
+
+    async def write(self, now, place, chat, plans, want_ideas):
+        self.calls.append((place, plans, want_ideas))
+        return self.notes
+
+
+class MorningBriefTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.cfg = ai_config()
+        self.now = datetime.now(TZ).replace(hour=8, minute=0)
+        today = self.now.date()
+        self.cfg.brief = BriefConfig(time(8), today.weekday())
+        self.cfg.dates = [ImportantDate("our anniversary", today - timedelta(days=60) + timedelta(days=2), "year", 3)]
+        self.calendar = FakeCalendar([
+            gcal.Event("a", "Aquarium with Raya", f"{today.isoformat()}T14:00", "", ours=True),
+            gcal.Event("b", "Her lifeguard shift", today.isoformat(), "", ours=True),
+            gcal.Event("c", "Tomorrow thing", f"{(today + timedelta(days=1)).isoformat()}T09:00", "", ours=True),
+        ])
+        self.telegram = FakeTelegram([SimpleNamespace(id=1, date=datetime.now(timezone.utc), out=False, message="shift tmrw ugh")])
+
+    async def test_full_brief(self):
+        briefer = FakeBriefer(SimpleNamespace(ask_about=["how her shift went"], date_ideas=["picnic at the botanic gardens"]))
+        text = await MorningBrief(self.cfg, self.telegram, "her", briefer, self.calendar, State(None)).build(self.now)
+        self.assertTrue(text.startswith(f"☀️ {self.now:%A}"))
+        self.assertIn("• 2:00pm Aquarium with Raya", text)
+        self.assertIn("• All day: Her lifeguard shift", text)
+        self.assertNotIn("Tomorrow thing", text)
+        self.assertIn("Ask her about:\n• how her shift went", text)
+        self.assertIn("Date ideas for this week:\n• picnic at the botanic gardens", text)
+        place, plans, want_ideas = briefer.calls[0]
+        self.assertEqual((place, want_ideas), ("New_York".replace("_", " "), True))
+        self.assertEqual(len(plans), 2)
+
+    async def test_dates_show_up(self):
+        self.cfg.dates = [ImportantDate("our anniversary", self.now.date() - timedelta(days=365), "year", 3)]
+        text = await MorningBrief(self.cfg, self.telegram, "her", None, None, State(None)).build(self.now)
+        self.assertIn("🎉 Today: our anniversary (1 year)!", text)
+
+    async def test_nothing_to_say(self):
+        self.cfg.dates = []
+        briefer = FakeBriefer(SimpleNamespace(ask_about=[], date_ideas=[]))
+        self.assertIsNone(await MorningBrief(self.cfg, self.telegram, "her", briefer, FakeCalendar([]), State(None)).build(self.now))
+
+    async def test_claude_unreachable_still_sends_the_rest(self):
+        text = await MorningBrief(self.cfg, self.telegram, "her", FakeBriefer(None), self.calendar, State(None)).build(self.now)
+        self.assertIn("Aquarium with Raya", text)
+        self.assertNotIn("Ask her about", text)
+
+
+@unittest.skipUnless(HAS_ANTHROPIC, "anthropic not installed")
+class BriefWriterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_request(self):
+        from ai import BriefWriter
+
+        mock_claude = MockClaude(body=MockClaude.reply({"ask_about": ["her shift"], "date_ideas": []}))
+        notes = await BriefWriter(mock_claude.client, "claude-opus-5-5", "Her name is Sam.").write(
+            at(8), "Melbourne", [ChatLine(1, at(7), "her", "shift today ugh")], ["2:00pm Aquarium"], want_ideas=False)
+        self.assertEqual(notes.ask_about, ["her shift"])
+        prompt = json.loads(mock_claude.requests[0].content)["messages"][0]["content"]
+        self.assertIn("We live in Melbourne.", prompt)
+        self.assertIn("- 2:00pm Aquarium", prompt)
+        self.assertIn("Date ideas: not today.", prompt)
+        self.assertIn("her: shift today ugh", prompt)
 
 
 if __name__ == "__main__":

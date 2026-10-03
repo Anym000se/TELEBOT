@@ -8,6 +8,7 @@ Setup is in README.md. Quick reference:
     python bot.py --now "good morning" --to me   # same, but to your Saved Messages
     python bot.py --check-calendar        # show what it would put on your calendar (changes nothing)
     python bot.py --check-reply           # show what it would auto-reply to her right now (sends nothing)
+    python bot.py --brief                 # show this morning's brief (add --to me to get it in Telegram)
 
 With [ai] turned on in config.toml, Claude writes each text (see ai.py). With [calendar]
 turned on, plans you make in the chat go on your Google Calendar (see gcal.py).
@@ -21,6 +22,7 @@ import random
 import re
 import sys
 import tomllib
+from calendar import monthrange
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -78,6 +80,29 @@ class AutoReplyConfig:
 
 
 @dataclass
+class RemindersConfig:
+    before: timedelta
+    only_plans_from_chat: bool
+
+
+@dataclass
+class BriefConfig:
+    at: time
+    date_ideas_on: int | None  # weekday, Monday = 0
+
+
+@dataclass
+class ImportantDate:
+    name: str
+    start: date
+    every: str  # "month" or "year"
+    heads_up_days: int
+
+
+WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+
+
+@dataclass
 class Config:
     api_id: int | str | None
     api_hash: str | None
@@ -90,6 +115,9 @@ class Config:
     ai: AIConfig
     calendar: CalendarConfig | None = None
     auto_reply: AutoReplyConfig | None = None
+    reminders: RemindersConfig | None = None
+    brief: BriefConfig | None = None
+    dates: list[ImportantDate] | None = None
 
     def slot(self, name: str) -> Slot:
         for slot in self.slots:
@@ -210,6 +238,40 @@ def load_config(path: Path) -> Config:
             raise ConfigError('quiet_hours under [auto_reply] should look like ["23:30", "07:30"], or [] for none.')
         auto_reply = AutoReplyConfig(timedelta(minutes=after), quiet_hours, bool(reply_raw.get("notify_me", True)))
 
+    reminders = None
+    reminders_raw = raw.get("reminders", {})
+    if reminders_raw.get("enabled", False):
+        if calendar is None:
+            raise ConfigError("Reminders need calendar sync. Turn on [calendar] too, or set enabled = false under [reminders].")
+        before = reminders_raw.get("minutes_before", 60)
+        if isinstance(before, bool) or not isinstance(before, int) or not 5 <= before <= 1440:
+            raise ConfigError("minutes_before under [reminders] should be a number from 5 to 1440 (no quotes).")
+        reminders = RemindersConfig(timedelta(minutes=before), bool(reminders_raw.get("only_plans_from_chat", True)))
+
+    brief = None
+    brief_raw = raw.get("morning_brief", {})
+    if brief_raw.get("enabled", False):
+        ideas_day = str(brief_raw.get("date_ideas_on", "thursday")).strip().lower()
+        if ideas_day and ideas_day not in WEEKDAYS:
+            raise ConfigError('date_ideas_on under [morning_brief] should be a day like "thursday", or "" for never.')
+        brief = BriefConfig(_parse_time(brief_raw.get("at", "08:00"), "morning_brief"),
+                            WEEKDAYS.index(ideas_day) if ideas_day else None)
+
+    dates = []
+    for entry in raw.get("dates", []):
+        name = str(entry.get("name", "")).strip()
+        try:
+            start = date.fromisoformat(str(entry.get("date", "")))
+        except ValueError:
+            raise ConfigError(f'Date "{name or "?"}": `date` should look like "2026-08-02"') from None
+        every = str(entry.get("every", "year")).strip().lower()
+        if not name or every not in ("month", "year"):
+            raise ConfigError(f'Date "{name or "?"}": needs a `name`, and `every` should be "month" or "year"')
+        heads_up = entry.get("heads_up_days", 3)
+        if isinstance(heads_up, bool) or not isinstance(heads_up, int) or not 0 <= heads_up <= 60:
+            raise ConfigError(f'Date "{name}": heads_up_days should be a number from 0 to 60')
+        dates.append(ImportantDate(name, start, every, heads_up))
+
     skip_minutes = float(raw.get("skip_if_i_texted_within_minutes", 0))
     return Config(
         api_id=raw.get("api_id"),
@@ -223,6 +285,9 @@ def load_config(path: Path) -> Config:
         ai=ai,
         calendar=calendar,
         auto_reply=auto_reply,
+        reminders=reminders,
+        brief=brief,
+        dates=dates,
     )
 
 
@@ -282,6 +347,13 @@ class State:
     @auto_reply_skipped.setter
     def auto_reply_skipped(self, message_id: int):
         self.data["auto_reply_skipped"] = message_id
+        self.save()
+
+    def get(self, key: str, default=None):
+        return self.data.get(key, default)
+
+    def put(self, key: str, value):
+        self.data[key] = value
         self.save()
 
     def save(self):
@@ -360,10 +432,18 @@ async def resolve(client, cfg: Config, recipient: str, needs_her: bool):
     return to, (await find(client, cfg.recipient) if needs_her else None)
 
 
-def make_ai(cfg: Config):
-    """Claude, as (text writer, plan finder, auto-replier). Each is None if the feature using it is off."""
-    if not cfg.ai.write_texts and cfg.calendar is None and cfg.auto_reply is None:
-        return None, None, None
+@dataclass
+class AIParts:
+    """The Claude-powered pieces. Each is None if the feature using it is off."""
+    writer: object = None  # writes the scheduled texts
+    finder: object = None  # spots plans for the calendar
+    replier: object = None  # writes holding replies
+    briefer: object = None  # writes parts of the morning brief
+
+
+def make_ai(cfg: Config) -> AIParts:
+    if not (cfg.ai.write_texts or cfg.calendar or cfg.auto_reply or cfg.brief):
+        return AIParts()
     try:
         import ai
     except ImportError:
@@ -376,15 +456,18 @@ def make_ai(cfg: Config):
     client = ai.new_client(cfg.ai.api_key)
     if not ai.has_credentials(client):
         raise ConfigError(
-            "There's no Anthropic API key (AI texts, the calendar and auto-replies need one). Put it under "
+            "There's no Anthropic API key (the AI features need one). Put it under "
             '[ai] in config.toml as: api_key = "sk-ant-..."' + cfg.ai.key_hint
         )
     if "___" in cfg.ai.about_us:
         log.warning("Tip: fill in about_us under [ai] in config.toml so Claude knows who's who")
-    writer = ai.Writer(client, cfg.ai.model, cfg.ai.about_us) if cfg.ai.write_texts else None
-    finder = ai.PlanFinder(client, cfg.ai.model, cfg.ai.about_us) if cfg.calendar else None
-    replier = ai.Replier(client, cfg.ai.model, cfg.ai.about_us) if cfg.auto_reply else None
-    return writer, finder, replier
+    model, about = cfg.ai.model, cfg.ai.about_us
+    return AIParts(
+        writer=ai.Writer(client, model, about) if cfg.ai.write_texts else None,
+        finder=ai.PlanFinder(client, model, about) if cfg.calendar else None,
+        replier=ai.Replier(client, model, about) if cfg.auto_reply else None,
+        briefer=ai.BriefWriter(client, model, about) if cfg.brief else None,
+    )
 
 
 def _is_google_file(path: Path) -> bool:
@@ -523,6 +606,32 @@ async def send(client, entity, text: str):
             await asyncio.sleep(30)
 
 
+async def ping(client, text: str, at: datetime | None = None):
+    """A note to yourself in Saved Messages that makes your phone buzz.
+
+    Telegram doesn't notify you about messages you send yourself, but it does for scheduled
+    ones in Saved Messages (that's its reminder feature). So this schedules the note for `at`,
+    or a few seconds from now.
+    """
+    soon = datetime.now(timezone.utc) + timedelta(seconds=15)
+    try:
+        await client.send_message("me", text, schedule=max(at, soon) if at else soon)
+    except Exception as e:  # Telegram refused the schedule; a silent note beats none
+        log.warning("Couldn't schedule a reminder (%s), sending it as a normal note", e)
+        await client.send_message("me", text)
+
+
+def _clock(when: datetime) -> str:
+    return f"{when.hour % 12 or 12}:{when:%M}{'am' if when.hour < 12 else 'pm'}"
+
+
+def _duration(span: timedelta) -> str:
+    minutes = max(1, round(span.total_seconds() / 60))
+    hours, minutes = divmod(minutes, 60)
+    parts = [f"{hours} hour{'s' if hours != 1 else ''}"] if hours else []
+    return " ".join(parts + [f"{minutes} min"] if minutes else parts)
+
+
 # Messages worth asking Claude about for the calendar: anything mentioning a day, a time, or a
 # plan. It's deliberately generous; its only job is to skip the "lol"s and "love you"s for free.
 PLAN_HINTS = re.compile(
@@ -588,7 +697,7 @@ class CalendarWatcher:
             log.warning("%s", e)
             if not self._told_signed_out:  # once is enough; the texts keep going either way
                 self._told_signed_out = True
-                await self.client.send_message("me", f"📅 Calendar sync has stopped. {e}")
+                await ping(self.client, f"📅 Calendar sync has stopped. {e}")
         except gcal.CalendarError as e:
             log.warning("Google Calendar problem, will try again after the next message: %s", e)
         except Exception:
@@ -760,9 +869,8 @@ class AutoReplier:
                 self.state.auto_reply_skipped = first.id
                 log.info("Auto-reply: not replying for you, this needs you: %s", draft.skip_reason)
                 if self.cfg.auto_reply.notify_me:
-                    await self.client.send_message(
-                        "me", f"⚠️ She's been waiting {minutes} min and this needs you, so I didn't reply for you: "
-                              f"{draft.skip_reason}")
+                    await ping(self.client, f"⚠️ She's been waiting {minutes} min and this needs you, so I didn't "
+                                            f"reply for you: {draft.skip_reason}")
                 return None
 
             sent = await send(self.client, self.her, draft.message)
@@ -786,16 +894,173 @@ class AutoReplier:
         return f'It would NOT reply, and would tell you instead: {draft.skip_reason}\n(Its draft was: "{draft.message}")'
 
 
+def _clamped(year: int, month: int, day: int) -> date:
+    """That day of the month, or the month's last day if it's shorter (the 31st in April is the 30th)."""
+    return date(year, month, min(day, monthrange(year, month)[1]))
+
+
+def next_occurrence(important: ImportantDate, today: date) -> tuple[date, int]:
+    """When it next comes round (today counts) and how many months or years that will be."""
+    start = important.start
+    if start >= today:
+        return start, 0
+    if important.every == "year":
+        when, count = _clamped(today.year, start.month, start.day), today.year - start.year
+        if when < today:
+            when, count = _clamped(today.year + 1, start.month, start.day), count + 1
+    else:
+        when, count = _clamped(today.year, today.month, start.day), (today.year - start.year) * 12 + today.month - start.month
+        if when < today:
+            year, month = (today.year + 1, 1) if today.month == 12 else (today.year, today.month + 1)
+            when, count = _clamped(year, month, start.day), count + 1
+    return when, count
+
+
+def describe_date(important: ImportantDate, count: int) -> str:
+    """'our anniversary (3 months)', 'our anniversary (1 year)', or just the name."""
+    if count <= 0:
+        return important.name
+    if important.every == "month" and count % 12:
+        return f"{important.name} ({count} month{'s' if count != 1 else ''})"
+    years = count // 12 if important.every == "month" else count
+    if "birthday" in important.name.lower():
+        return f"{important.name} (turns {years})"
+    return f"{important.name} ({years} year{'s' if years != 1 else ''})"
+
+
+def dates_coming_up(dates: list[ImportantDate], today: date) -> list[str]:
+    """Lines for the brief: important dates that are today, or close enough for a heads-up."""
+    lines = []
+    for important in dates:
+        when, count = next_occurrence(important, today)
+        days = (when - today).days
+        if days == 0:
+            lines.append(f"🎉 Today: {describe_date(important, count)}!")
+        elif days <= important.heads_up_days:
+            soon = "tomorrow" if days == 1 else f"in {days} days ({when:%a %b} {when.day})"
+            lines.append(f"🎉 {describe_date(important, count)} is {soon}. Maybe plan something?")
+    return lines
+
+
+class Reminders:
+    """Buzzes you a while before plans on your calendar."""
+
+    poll_seconds = 600
+
+    def __init__(self, cfg: Config, client, calendar: gcal.GoogleCalendar, state: State):
+        self.cfg, self.client, self.calendar, self.state = cfg, client, calendar, state
+
+    async def run(self):
+        while True:
+            try:
+                await self.check()
+            except gcal.CalendarError as e:
+                log.warning("Reminders: Google Calendar problem: %s", e)
+            except Exception:
+                log.exception("Reminders: check failed")
+            await asyncio.sleep(self.poll_seconds)
+
+    async def check(self) -> list[str]:
+        """Schedule reminders that are due before the next check. Returns them."""
+        now = datetime.now(self.cfg.tz)
+        lead = self.cfg.reminders.before
+        reminded = self.state.get("reminded", [])
+        due = []
+        for event in await asyncio.to_thread(self.calendar.upcoming, 2):
+            if "T" not in event.start or (self.cfg.reminders.only_plans_from_chat and not event.ours):
+                continue  # all-day things are in the morning brief instead
+            start = datetime.fromisoformat(event.start).replace(tzinfo=self.cfg.tz)
+            key = f"{event.id}@{event.start}"  # a moved event gets a new reminder
+            remind_at = start - lead
+            if key in reminded or start <= now or remind_at > now + timedelta(seconds=self.poll_seconds):
+                continue
+            text = f"⏰ {event.title} at {_clock(start)}, in {_duration(start - max(remind_at, now))}"
+            await ping(self.client, text, at=remind_at)
+            reminded = (reminded + [key])[-200:]
+            self.state.put("reminded", reminded)
+            log.info("Reminder set: %s", text)
+            due.append(text)
+        return due
+
+
+class MorningBrief:
+    """Every morning, a private note: today's plans, dates coming up, things to ask her about, date ideas."""
+
+    def __init__(self, cfg: Config, client, her, briefer, calendar: gcal.GoogleCalendar | None, state: State):
+        self.cfg, self.client, self.her = cfg, client, her
+        self.briefer, self.calendar, self.state = briefer, calendar, state
+
+    async def run(self):
+        while True:
+            now = datetime.now(self.cfg.tz)
+            due = datetime.combine(now.date(), self.cfg.brief.at, self.cfg.tz)
+            if now < due:
+                await sleep_until(due)
+                continue
+            # Catch up if the bot started a bit after brief time, but not hours later.
+            if self.state.get("brief_sent") != now.date().isoformat() and now - due < timedelta(hours=3):
+                try:
+                    text = await self.build(now)
+                    if text:
+                        await ping(self.client, text)
+                        log.info("Sent the morning brief")
+                except Exception:
+                    log.exception("Morning brief failed")
+                self.state.put("brief_sent", now.date().isoformat())
+            await sleep_until(datetime.combine(now.date() + timedelta(days=1), self.cfg.brief.at, self.cfg.tz))
+
+    async def _todays_plans(self, today: date) -> list[str]:
+        if self.calendar is None:
+            return []
+        plans = []
+        for event in await asyncio.to_thread(self.calendar.upcoming, 1):
+            if "T" in event.start:
+                if event.start[:10] == today.isoformat():
+                    plans.append(f"{_clock(datetime.fromisoformat(event.start))} {event.title}")
+            elif event.start <= today.isoformat() <= (event.end or event.start):
+                plans.append(f"All day: {event.title}")
+        return plans
+
+    async def build(self, now: datetime) -> str | None:
+        """The brief's text, or None if there's nothing worth saying today."""
+        today = now.date()
+        try:
+            plans = await self._todays_plans(today)
+        except gcal.CalendarError as e:
+            log.warning("Morning brief: couldn't read the calendar: %s", e)
+            plans = []
+        sections = []
+        if plans:
+            sections.append("Today:\n" + "\n".join(f"• {plan}" for plan in plans))
+        if upcoming := dates_coming_up(self.cfg.dates or [], today):
+            sections.append("\n".join(upcoming))
+        if self.briefer is not None:
+            chat = await recent_chat(self.client, self.her, self.cfg.tz, self.cfg.ai.read_last_messages)
+            place = self.cfg.tz.key.split("/")[-1].replace("_", " ")
+            want_ideas = self.cfg.brief.date_ideas_on == today.weekday()
+            notes = await self.briefer.write(now, place, chat, plans, want_ideas)
+            if notes and notes.ask_about:
+                sections.append("Ask her about:\n" + "\n".join(f"• {item}" for item in notes.ask_about))
+            if notes and notes.date_ideas:
+                sections.append("Date ideas for this week:\n" + "\n".join(f"• {idea}" for idea in notes.date_ideas))
+        if not sections:
+            return None
+        return f"☀️ {today:%A, %B} {today.day}\n\n" + "\n\n".join(sections)
+
+
 def _and(names: list[str]) -> str:
     return names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
 
 
-async def run_forever(cfg: Config, state: State, writer, finder, replier, calendar, recipient: str,
+async def run_forever(cfg: Config, state: State, parts: AIParts, calendar, recipient: str,
                       skip_within: timedelta | None):
+    writer, finder, replier = parts.writer, parts.finder, parts.replier
     client = await connect(cfg)
+    background: list[asyncio.Task] = []  # loops that run alongside the texts
     try:
         watching = calendar is not None and finder is not None
-        needs_her = (writer is not None and cfg.ai.read_recent_chat) or watching or replier is not None
+        needs_her = ((writer is not None and cfg.ai.read_recent_chat) or watching or replier is not None
+                     or parts.briefer is not None)
         to, her = await resolve(client, cfg, recipient, needs_her)
         bot_sent: set[int] = set()  # the bot's own texts, so nothing mistakes them for you
         watcher = auto = None
@@ -805,7 +1070,14 @@ async def run_forever(cfg: Config, state: State, writer, finder, replier, calend
         if replier is not None:
             auto = AutoReplier(cfg, client, her, replier, state, bot_sent)
             auto.start()
-        extras = [name for name, on in (("AI texts", writer), ("calendar sync", watcher), ("auto-replies", auto)) if on]
+        if cfg.reminders and calendar is not None:
+            background.append(asyncio.create_task(Reminders(cfg, client, calendar, state).run()))
+        if cfg.brief:
+            background.append(asyncio.create_task(MorningBrief(cfg, client, her, parts.briefer, calendar, state).run()))
+        extras = [name for name, on in (
+            ("AI texts", writer), ("calendar sync", watcher), ("auto-replies", auto),
+            ("reminders", cfg.reminders and calendar), ("a morning brief", cfg.brief),
+        ) if on]
         log.info(
             "Logged in. Texting %s on schedule%s (Ctrl+C to stop).",
             recipient, f" with {_and(extras)}" if extras else "",
@@ -840,6 +1112,8 @@ async def run_forever(cfg: Config, state: State, writer, finder, replier, calend
             day += timedelta(days=1)
             await sleep_until(datetime.combine(day, time(0), cfg.tz))
     finally:
+        for task in background:
+            task.cancel()
         await client.disconnect()
 
 
@@ -882,6 +1156,21 @@ async def check_reply(cfg: Config, replier):
         await client.disconnect()
 
 
+async def show_brief(cfg: Config, briefer, calendar, send_to_me: bool):
+    client = await connect(cfg)
+    try:
+        her = await find(client, cfg.recipient)
+        text = await MorningBrief(cfg, client, her, briefer, calendar, State(None)).build(datetime.now(cfg.tz))
+        text = text or "(Nothing to put in today's brief.)"
+        if send_to_me:
+            await ping(client, text)
+            print("Sent to your Saved Messages. It should buzz in about 15 seconds.")
+        else:
+            print("\n" + text)
+    finally:
+        await client.disconnect()
+
+
 def print_plan(cfg: Config, state: State, days: int = 3):
     now = datetime.now(cfg.tz)
     for offset in range(days):
@@ -904,6 +1193,8 @@ def main():
                       help="show what it would put on your calendar from the last few days of chat (changes nothing)")
     mode.add_argument("--check-reply", action="store_true",
                       help="show what it would auto-reply to her if she'd been waiting right now (sends nothing)")
+    mode.add_argument("--brief", action="store_true",
+                      help="show today's morning brief (with --to me, send it to your Saved Messages)")
     parser.add_argument("--to", metavar="WHO", help='send to someone else instead, e.g. "me" for your Saved Messages')
     args = parser.parse_args()
 
@@ -919,28 +1210,31 @@ def main():
             print_plan(cfg, state)
         elif args.now:
             slot = cfg.slot(args.now)
-            writer, _, _ = make_ai(cfg)
-            asyncio.run(send_now(cfg, state, writer, recipient, slot))
+            asyncio.run(send_now(cfg, state, make_ai(cfg).writer, recipient, slot))
         elif args.check_calendar:
             if cfg.calendar is None:
                 raise ConfigError("Calendar sync is off. Set enabled = true under [calendar] in config.toml.")
-            _, finder, _ = make_ai(cfg)
-            asyncio.run(check_calendar(cfg, finder, open_calendar(cfg), args.to or cfg.recipient))
+            asyncio.run(check_calendar(cfg, make_ai(cfg).finder, open_calendar(cfg), args.to or cfg.recipient))
         elif args.check_reply:
             if cfg.auto_reply is None:
                 raise ConfigError("Auto-replies are off. Set enabled = true under [auto_reply] in config.toml.")
-            _, _, replier = make_ai(cfg)
-            asyncio.run(check_reply(cfg, replier))
+            asyncio.run(check_reply(cfg, make_ai(cfg).replier))
+        elif args.brief:
+            if cfg.brief is None:
+                raise ConfigError("The morning brief is off. Set enabled = true under [morning_brief] in config.toml.")
+            if args.to and args.to != "me":
+                raise ConfigError('The brief only goes to you: use --to me, or leave --to off to see it here.')
+            asyncio.run(show_brief(cfg, make_ai(cfg).briefer, open_calendar(cfg), send_to_me=bool(args.to)))
         else:
-            writer, finder, replier = make_ai(cfg)
+            parts = make_ai(cfg)
             calendar = None
             if args.to and (cfg.calendar or cfg.auto_reply):
-                log.info("Calendar sync and auto-replies are off during test runs with --to")
-                replier = None
+                log.info("Calendar sync, reminders and auto-replies are off during test runs with --to")
+                parts.replier = None
             elif cfg.calendar:
                 calendar = open_calendar(cfg)
             skip_within = None if args.to else cfg.skip_if_texted_within
-            asyncio.run(run_forever(cfg, state, writer, finder, replier, calendar, recipient, skip_within))
+            asyncio.run(run_forever(cfg, state, parts, calendar, recipient, skip_within))
     except ConfigError as e:
         sys.exit(f"Error: {e}")
     except KeyboardInterrupt:
