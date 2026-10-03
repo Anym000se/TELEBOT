@@ -38,8 +38,9 @@ write two parts of it.
 
 `ask_about`: things from our recent chat worth following up on today, like asking how her \
 shift or exam went, wishing her luck for something, or remembering something she was \
-excited or worried about. Short and specific, at most 3. Use an empty list if nothing \
-stands out. Don't invent anything that isn't in the chat.
+excited or worried about. If her calendar is included, what's on it counts too: wish her \
+luck before something, or ask how it went after. Short and specific, at most 3. Use an \
+empty list if nothing stands out. Don't invent anything that isn't in the chat or the calendars.
 
 `date_ideas`: only when I ask for them. Then suggest 3 specific, doable date ideas for the \
 coming week that fit what she's into, what we've talked about, the season, and where we \
@@ -293,10 +294,17 @@ class BriefWriter:
         self.model = model
         self.system = BRIEF_PROMPT.format(about_us=about_us or "(nothing provided)")
 
-    async def write(self, now: datetime, place: str, chat, plans: list[str], want_ideas: bool) -> Brief | None:
-        """Things to ask her about, and date ideas if wanted. None if Claude couldn't be asked."""
+    async def write(self, now: datetime, place: str, chat, plans: list[str], want_ideas: bool,
+                    others: dict[str, list[str]] | None = None) -> Brief | None:
+        """Things to ask her about, and date ideas if wanted. None if Claude couldn't be asked.
+
+        `others` is what's on other people's calendars today (shared with me, read-only), by name.
+        """
         lines = [f"It's {now:%A, %B} {now.day}, {now.year}. We live in {place}.", ""]
         lines += ["On my calendar today:", *(f"- {plan}" for plan in plans)] if plans else ["(Nothing on my calendar today.)"]
+        for name, theirs in (others or {}).items():
+            lines += [f"On {name}'s calendar today:", *(f"- {plan}" for plan in theirs)] if theirs else [
+                f"(Nothing on {name}'s calendar today.)"]
         lines += ["", "Date ideas: yes please." if want_ideas else "Date ideas: not today.", ""]
         lines += ["Our recent chat, oldest first:", *_format_chat(chat)] if chat else ["(No recent messages.)"]
         return await ask(self.client, self.model, self.system, "\n".join(lines), Brief, "so the brief skips that part")

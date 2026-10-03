@@ -962,6 +962,12 @@ class ExtrasConfigTests(unittest.TestCase):
         self.assertEqual(cfg.brief, BriefConfig(time(8), 3))
         self.assertEqual(cfg.dates, [])
 
+    def test_also_read(self):
+        cfg = self.load('[calendar]\nenabled = true\n[calendar.also_read]\nRaya = "raya@gmail.com"\n')
+        self.assertEqual(cfg.calendar.also_read, {"Raya": "raya@gmail.com"})
+        with self.assertRaisesRegex(ConfigError, "also_read"):
+            self.load('[calendar]\nenabled = true\nalso_read = "raya@gmail.com"\n')
+
     def test_dates(self):
         cfg = self.load('[[dates]]\nname = "our anniversary"\ndate = "2026-08-02"\nevery = "month"\n')
         self.assertEqual(cfg.dates, [ImportantDate("our anniversary", date(2026, 8, 2), "month", 3)])
@@ -1061,8 +1067,8 @@ class FakeBriefer:
         self.notes = notes
         self.calls = []
 
-    async def write(self, now, place, chat, plans, want_ideas):
-        self.calls.append((place, plans, want_ideas))
+    async def write(self, now, place, chat, plans, want_ideas, others=None):
+        self.calls.append((place, plans, want_ideas, others))
         return self.notes
 
 
@@ -1089,7 +1095,7 @@ class MorningBriefTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Tomorrow thing", text)
         self.assertIn("Ask her about:\n• how her shift went", text)
         self.assertIn("Date ideas for this week:\n• picnic at the botanic gardens", text)
-        place, plans, want_ideas = briefer.calls[0]
+        place, plans, want_ideas, _ = briefer.calls[0]
         self.assertEqual((place, want_ideas), ("New_York".replace("_", " "), True))
         self.assertEqual(len(plans), 2)
 
@@ -1103,10 +1109,42 @@ class MorningBriefTests(unittest.IsolatedAsyncioTestCase):
         briefer = FakeBriefer(SimpleNamespace(ask_about=[], date_ideas=[]))
         self.assertIsNone(await MorningBrief(self.cfg, self.telegram, "her", briefer, FakeCalendar([]), State(None)).build(self.now))
 
+    async def test_her_shared_calendar(self):
+        today = self.now.date()
+        hers = FakeCalendar([gcal.Event("h", "Lifeguard shift", f"{today.isoformat()}T09:00", f"{today.isoformat()}T13:00", ours=False)])
+        briefer = FakeBriefer(SimpleNamespace(ask_about=["wish her luck for her shift"], date_ideas=[]))
+        brief = MorningBrief(self.cfg, self.telegram, "her", briefer, self.calendar, State(None), {"Raya": hers})
+        text = await brief.build(self.now)
+        self.assertIn("Raya today:\n• 9:00am Lifeguard shift", text)
+        self.assertEqual(briefer.calls[0][3], {"Raya": ["9:00am Lifeguard shift"]})
+        self.assertEqual((hers.added, hers.updated, hers.cancelled), ([], [], []))  # only ever read
+
     async def test_claude_unreachable_still_sends_the_rest(self):
         text = await MorningBrief(self.cfg, self.telegram, "her", FakeBriefer(None), self.calendar, State(None)).build(self.now)
         self.assertIn("Aquarium with Raya", text)
         self.assertNotIn("Ask her about", text)
+
+
+class OtherCalendarsTests(unittest.TestCase):
+    def test_unreadable_calendar_is_skipped(self):
+        from bot import CalendarConfig, open_other_calendars
+
+        cfg = ai_config()
+        cfg.calendar = CalendarConfig("primary", True, Path("x"), Path("y"), {"Raya": "raya@gmail.com", "Old": "gone@gmail.com"})
+
+        class Session:
+            def request(self, method, url, **kwargs):
+                if "gone" in url:
+                    return FakeResponse({"error": {"message": "Not Found"}}, 404)
+                return FakeResponse({"items": []})
+
+        main = gcal.GoogleCalendar(Session(), "primary", TZ)
+        with self.assertLogs("telebot", "WARNING") as logs:
+            others = open_other_calendars(cfg, main)
+        self.assertEqual(list(others), ["Raya"])
+        self.assertIn("Couldn't read Old's calendar", logs.output[0])
+        self.assertTrue(others["Raya"].url.endswith("/calendars/raya%40gmail.com/events"))
+        self.assertEqual(open_other_calendars(cfg, None), {})
 
 
 @unittest.skipUnless(HAS_ANTHROPIC, "anthropic not installed")
@@ -1116,12 +1154,14 @@ class BriefWriterTests(unittest.IsolatedAsyncioTestCase):
 
         mock_claude = MockClaude(body=MockClaude.reply({"ask_about": ["her shift"], "date_ideas": []}))
         notes = await BriefWriter(mock_claude.client, "claude-opus-5-5", "Her name is Sam.").write(
-            at(8), "Melbourne", [ChatLine(1, at(7), "her", "shift today ugh")], ["2:00pm Aquarium"], want_ideas=False)
+            at(8), "Melbourne", [ChatLine(1, at(7), "her", "shift today ugh")], ["2:00pm Aquarium"], want_ideas=False,
+            others={"Raya": ["9:00am Lifeguard shift"]})
         self.assertEqual(notes.ask_about, ["her shift"])
         prompt = json.loads(mock_claude.requests[0].content)["messages"][0]["content"]
         self.assertIn("We live in Melbourne.", prompt)
         self.assertIn("- 2:00pm Aquarium", prompt)
         self.assertIn("Date ideas: not today.", prompt)
+        self.assertIn("On Raya's calendar today:\n- 9:00am Lifeguard shift", prompt)
         self.assertIn("her: shift today ugh", prompt)
 
 

@@ -61,6 +61,14 @@ calendar_id = "primary"
 # Send yourself a note in Saved Messages whenever it adds, moves, or removes something.
 notify_me = true
 
+# Calendars other people share with you, shown in your morning brief ("Raya today: ...").
+# The bot only ever reads these. It never adds to or changes them. Their event titles do go
+# to Claude for the "ask her about" part. Find a calendar's ID in Google Calendar: Settings >
+# click that calendar on the left > "Integrate calendar" > Calendar ID. To use it, delete the
+# # at the start of both lines.
+# [calendar.also_read]
+# Raya = "her-calendar-id@gmail.com"
+
 [auto_reply]
 # If she texts and you haven't replied after a while, send ONE short holding reply in your
 # style ("sorry got caught up, will text you properly soon"). It never answers questions,

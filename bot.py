@@ -70,6 +70,7 @@ class CalendarConfig:
     notify_me: bool
     credentials_path: Path
     token_path: Path
+    also_read: dict[str, str] | None = None  # name -> calendar ID, read-only, for the morning brief
 
 
 @dataclass
@@ -216,11 +217,15 @@ def load_config(path: Path) -> Config:
     calendar = None
     calendar_raw = raw.get("calendar", {})
     if calendar_raw.get("enabled", False):
+        also_read = calendar_raw.get("also_read", {})
+        if not isinstance(also_read, dict) or not all(isinstance(v, str) and v.strip() for v in also_read.values()):
+            raise ConfigError('[calendar.also_read] should have lines like:  Raya = "her-calendar-id@gmail.com"')
         calendar = CalendarConfig(
             calendar_id=str(calendar_raw.get("calendar_id") or "primary"),
             notify_me=bool(calendar_raw.get("notify_me", True)),
             credentials_path=path.parent / "google-credentials.json",
             token_path=path.parent / "google-token.json",
+            also_read={name: cal_id.strip() for name, cal_id in also_read.items()},
         )
 
     auto_reply = None
@@ -532,6 +537,27 @@ def open_calendar(cfg: Config) -> gcal.GoogleCalendar | None:
     except gcal.CalendarError as e:
         raise ConfigError(f"Google Calendar isn't working yet. Google says: {e}" + (f"\n{share}" if robot else "")) from None
     return calendar
+
+
+def open_other_calendars(cfg: Config, main: gcal.GoogleCalendar | None) -> dict[str, gcal.GoogleCalendar]:
+    """The calendars listed under [calendar.also_read], by name. Read-only: nothing here writes to them.
+
+    One that can't be read is skipped with a warning, so it can't stop the rest of the bot.
+    """
+    if main is None or not cfg.calendar.also_read:
+        return {}
+    others = {}
+    for name, cal_id in cfg.calendar.also_read.items():
+        other = gcal.GoogleCalendar(main.session, cal_id, cfg.tz)
+        try:
+            other.upcoming(days=1)
+        except gcal.CalendarError as e:
+            log.warning(
+                "Couldn't read %s's calendar, so the brief will leave it out. Google says: %s. Check its ID under "
+                "[calendar.also_read] (Google Calendar > Settings > that calendar > Integrate calendar).", name, e)
+            continue
+        others[name] = other
+    return others
 
 
 def _describe(message) -> str:
@@ -986,9 +1012,11 @@ class Reminders:
 class MorningBrief:
     """Every morning, a private note: today's plans, dates coming up, things to ask her about, date ideas."""
 
-    def __init__(self, cfg: Config, client, her, briefer, calendar: gcal.GoogleCalendar | None, state: State):
+    def __init__(self, cfg: Config, client, her, briefer, calendar: gcal.GoogleCalendar | None, state: State,
+                 others: dict[str, gcal.GoogleCalendar] | None = None):
         self.cfg, self.client, self.her = cfg, client, her
         self.briefer, self.calendar, self.state = briefer, calendar, state
+        self.others = others or {}  # other people's shared calendars, only ever read
 
     async def run(self):
         while True:
@@ -1009,11 +1037,12 @@ class MorningBrief:
                 self.state.put("brief_sent", now.date().isoformat())
             await sleep_until(datetime.combine(now.date() + timedelta(days=1), self.cfg.brief.at, self.cfg.tz))
 
-    async def _todays_plans(self, today: date) -> list[str]:
-        if self.calendar is None:
+    @staticmethod
+    async def _todays_plans(calendar: gcal.GoogleCalendar | None, today: date) -> list[str]:
+        if calendar is None:
             return []
         plans = []
-        for event in await asyncio.to_thread(self.calendar.upcoming, 1):
+        for event in await asyncio.to_thread(calendar.upcoming, 1):
             if "T" in event.start:
                 if event.start[:10] == today.isoformat():
                     plans.append(f"{_clock(datetime.fromisoformat(event.start))} {event.title}")
@@ -1025,20 +1054,29 @@ class MorningBrief:
         """The brief's text, or None if there's nothing worth saying today."""
         today = now.date()
         try:
-            plans = await self._todays_plans(today)
+            plans = await self._todays_plans(self.calendar, today)
         except gcal.CalendarError as e:
             log.warning("Morning brief: couldn't read the calendar: %s", e)
             plans = []
+        theirs = {}
+        for name, other in self.others.items():
+            try:
+                theirs[name] = await self._todays_plans(other, today)
+            except gcal.CalendarError as e:
+                log.warning("Morning brief: couldn't read %s's calendar: %s", name, e)
         sections = []
         if plans:
             sections.append("Today:\n" + "\n".join(f"• {plan}" for plan in plans))
+        for name, their_plans in theirs.items():
+            if their_plans:
+                sections.append(f"{name} today:\n" + "\n".join(f"• {plan}" for plan in their_plans))
         if upcoming := dates_coming_up(self.cfg.dates or [], today):
             sections.append("\n".join(upcoming))
         if self.briefer is not None:
             chat = await recent_chat(self.client, self.her, self.cfg.tz, self.cfg.ai.read_last_messages)
             place = self.cfg.tz.key.split("/")[-1].replace("_", " ")
             want_ideas = self.cfg.brief.date_ideas_on == today.weekday()
-            notes = await self.briefer.write(now, place, chat, plans, want_ideas)
+            notes = await self.briefer.write(now, place, chat, plans, want_ideas, theirs)
             if notes and notes.ask_about:
                 sections.append("Ask her about:\n" + "\n".join(f"• {item}" for item in notes.ask_about))
             if notes and notes.date_ideas:
@@ -1053,7 +1091,7 @@ def _and(names: list[str]) -> str:
 
 
 async def run_forever(cfg: Config, state: State, parts: AIParts, calendar, recipient: str,
-                      skip_within: timedelta | None):
+                      skip_within: timedelta | None, others: dict[str, gcal.GoogleCalendar] | None = None):
     writer, finder, replier = parts.writer, parts.finder, parts.replier
     client = await connect(cfg)
     background: list[asyncio.Task] = []  # loops that run alongside the texts
@@ -1073,7 +1111,8 @@ async def run_forever(cfg: Config, state: State, parts: AIParts, calendar, recip
         if cfg.reminders and calendar is not None:
             background.append(asyncio.create_task(Reminders(cfg, client, calendar, state).run()))
         if cfg.brief:
-            background.append(asyncio.create_task(MorningBrief(cfg, client, her, parts.briefer, calendar, state).run()))
+            background.append(asyncio.create_task(
+                MorningBrief(cfg, client, her, parts.briefer, calendar, state, others).run()))
         extras = [name for name, on in (
             ("AI texts", writer), ("calendar sync", watcher), ("auto-replies", auto),
             ("reminders", cfg.reminders and calendar), ("a morning brief", cfg.brief),
@@ -1156,11 +1195,12 @@ async def check_reply(cfg: Config, replier):
         await client.disconnect()
 
 
-async def show_brief(cfg: Config, briefer, calendar, send_to_me: bool):
+async def show_brief(cfg: Config, briefer, calendar, send_to_me: bool, others=None):
     client = await connect(cfg)
     try:
         her = await find(client, cfg.recipient)
-        text = await MorningBrief(cfg, client, her, briefer, calendar, State(None)).build(datetime.now(cfg.tz))
+        brief = MorningBrief(cfg, client, her, briefer, calendar, State(None), others)
+        text = await brief.build(datetime.now(cfg.tz))
         text = text or "(Nothing to put in today's brief.)"
         if send_to_me:
             await ping(client, text)
@@ -1224,7 +1264,8 @@ def main():
                 raise ConfigError("The morning brief is off. Set enabled = true under [morning_brief] in config.toml.")
             if args.to and args.to != "me":
                 raise ConfigError('The brief only goes to you: use --to me, or leave --to off to see it here.')
-            asyncio.run(show_brief(cfg, make_ai(cfg).briefer, open_calendar(cfg), send_to_me=bool(args.to)))
+            calendar = open_calendar(cfg)
+            asyncio.run(show_brief(cfg, make_ai(cfg).briefer, calendar, bool(args.to), open_other_calendars(cfg, calendar)))
         else:
             parts = make_ai(cfg)
             calendar = None
@@ -1234,7 +1275,8 @@ def main():
             elif cfg.calendar:
                 calendar = open_calendar(cfg)
             skip_within = None if args.to else cfg.skip_if_texted_within
-            asyncio.run(run_forever(cfg, state, parts, calendar, recipient, skip_within))
+            others = open_other_calendars(cfg, calendar) if cfg.brief else {}
+            asyncio.run(run_forever(cfg, state, parts, calendar, recipient, skip_within, others))
     except ConfigError as e:
         sys.exit(f"Error: {e}")
     except KeyboardInterrupt:
